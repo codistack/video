@@ -46,7 +46,12 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
 
   useEffect(() => {
     const savedName = StorageService.getUserName();
-    if (savedName) setStudentName(savedName);
+    if (savedName) {
+      setStudentName(savedName);
+    } else {
+      const defaultName = 'Estudiante ' + Math.floor(100 + Math.random() * 900);
+      setStudentName(defaultName);
+    }
 
     if (initialRoomCode) {
       handleLookupRoom(initialRoomCode);
@@ -132,7 +137,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
         subject: subjectParam || 'Reunión Virtual',
         date: new Date().toISOString().split('T')[0],
         time: 'Ahora',
-        accessMode: modeParam || 'permission',
+        accessMode: modeParam || 'direct',
         adminName: adminParam || 'Docente',
         createdAt: new Date().toISOString(),
         status: 'live'
@@ -148,7 +153,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
         subject: 'Reunión Virtual',
         date: new Date().toISOString().split('T')[0],
         time: 'Ahora',
-        accessMode: 'permission',
+        accessMode: 'direct',
         adminName: 'Docente',
         createdAt: new Date().toISOString(),
         status: 'live'
@@ -433,13 +438,34 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
                 </div>
               )}
 
+              {/* Access Mode Indicator */}
+              {foundClass && (
+                <div className={`p-3 rounded-2xl text-xs flex items-center gap-2.5 border ${
+                  foundClass.accessMode === 'direct'
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                }`}>
+                  {foundClass.accessMode === 'direct' ? (
+                    <>
+                      <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span><strong>Acceso Directo:</strong> Ingreso inmediato con enlace compartido. No requiere inicio de sesión.</span>
+                    </>
+                  ) : (
+                    <>
+                      <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span><strong>Acceso Controlado:</strong> El docente verificará y autorizará tu ingreso en la sala.</span>
+                    </>
+                  )}
+                </div>
+              )}
+
               {/* Submit Buttons */}
               <div className="pt-2 space-y-2">
                 <button
                   type="submit"
                   className="w-full flex items-center justify-center gap-2 px-6 py-3.5 bg-gradient-to-r from-indigo-600 via-indigo-500 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-sm rounded-2xl shadow-xl shadow-indigo-600/30 hover:scale-[1.01] transition cursor-pointer"
                 >
-                  <span>{foundClass?.accessMode === 'permission' ? 'Solicitar Ingreso a la Sala' : 'Unirse a la Videoconferencia'}</span>
+                  <span>{foundClass?.accessMode === 'permission' ? 'Solicitar Ingreso a la Sala' : 'Entrar a la Clase Ahora (Acceso Directo)'}</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
 

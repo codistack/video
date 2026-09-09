@@ -150,5 +150,44 @@ export const StorageService = {
 
   setUserName(name: string): void {
     localStorage.setItem(USER_PROFILE_KEY, name);
+  },
+
+  getSharableRoomLink(
+    sessionOrCode: ClassSession | string,
+    customParams?: { title?: string; adminName?: string; accessMode?: string; subject?: string }
+  ): string {
+    let origin = window.location.origin;
+    // Replace Cloud Run dev URL with the public preview URL so external participants are NOT prompted for Google account login!
+    if (origin.includes('ais-dev-')) {
+      origin = origin.replace('ais-dev-', 'ais-pre-');
+    }
+
+    if (typeof sessionOrCode === 'object') {
+      const s = sessionOrCode;
+      const code = encodeURIComponent(s.code);
+      const title = encodeURIComponent(s.title || `Clase ${s.code}`);
+      const admin = encodeURIComponent(s.adminName || 'Docente');
+      const mode = encodeURIComponent(s.accessMode || 'direct');
+      const subject = encodeURIComponent(s.subject || 'Reunión Virtual');
+      return `${origin}/?room=${code}&role=student&title=${title}&admin=${admin}&mode=${mode}&subject=${subject}`;
+    }
+
+    const cleanCode = (sessionOrCode || '').trim().toUpperCase();
+    const found = this.getClassByCode(cleanCode);
+    if (found) {
+      const code = encodeURIComponent(found.code);
+      const title = encodeURIComponent(found.title || `Clase ${found.code}`);
+      const admin = encodeURIComponent(found.adminName || 'Docente');
+      const mode = encodeURIComponent(found.accessMode || 'direct');
+      const subject = encodeURIComponent(found.subject || 'Reunión Virtual');
+      return `${origin}/?room=${code}&role=student&title=${title}&admin=${admin}&mode=${mode}&subject=${subject}`;
+    }
+
+    const code = encodeURIComponent(cleanCode);
+    const title = encodeURIComponent(customParams?.title || `Sala ${cleanCode}`);
+    const admin = encodeURIComponent(customParams?.adminName || 'Docente');
+    const mode = encodeURIComponent(customParams?.accessMode || 'direct');
+    const subject = encodeURIComponent(customParams?.subject || 'Reunión Virtual');
+    return `${origin}/?room=${code}&role=student&title=${title}&admin=${admin}&mode=${mode}&subject=${subject}`;
   }
 };

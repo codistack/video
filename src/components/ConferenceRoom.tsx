@@ -25,6 +25,7 @@ import {
   PreCallSettings 
 } from '../types/conference';
 import { realtimeService } from '../services/realtime';
+import { StorageService } from '../services/storage';
 import { ChatPanel } from './ChatPanel';
 import { ParticipantsModal } from './ParticipantsModal';
 import { SubtitlesOverlay } from './SubtitlesOverlay';
@@ -1181,10 +1182,10 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   };
 
   const copyRoomLink = () => {
-    const link = `${window.location.origin}/?room=${encodeURIComponent(classSession.code)}&role=student&title=${encodeURIComponent(classSession.title)}&admin=${encodeURIComponent(classSession.adminName)}&mode=${classSession.accessMode}&subject=${encodeURIComponent(classSession.subject)}`;
+    const link = StorageService.getSharableRoomLink(classSession);
     navigator.clipboard.writeText(link);
     setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 2000);
+    setTimeout(() => setCopiedCode(false), 3000);
   };
 
   const toggleFullscreen = () => {
@@ -1205,7 +1206,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         
         {/* Top Floating Bar: Class Info & Copy Link */}
         <div className="absolute top-4 left-4 right-4 z-20 flex items-center justify-between pointer-events-none">
-          <div className="pointer-events-auto bg-slate-950/80 backdrop-blur-md border border-slate-800/80 px-4 py-2 rounded-2xl flex items-center gap-3 shadow-xl">
+          <div className="pointer-events-auto bg-slate-950/85 backdrop-blur-md border border-slate-800/80 px-4 py-2 rounded-2xl flex items-center gap-3 shadow-xl">
             <div className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse"></div>
             <div>
               <h2 className="text-xs font-bold text-white leading-none">{classSession.title}</h2>
@@ -1214,10 +1215,24 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
             <button
               onClick={copyRoomLink}
-              className="ml-2 p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 text-xs transition cursor-pointer"
-              title="Copiar enlace de invitación"
+              className={`ml-2 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-semibold transition cursor-pointer ${
+                copiedCode 
+                  ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300' 
+                  : 'bg-slate-900 border-slate-800 hover:bg-slate-800 text-slate-200'
+              }`}
+              title="Copiar enlace de acceso directo público (sin login)"
             >
-              {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+              {copiedCode ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="text-[11px] text-emerald-300 font-medium hidden sm:inline">¡Enlace Público Copiado!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5 text-indigo-400" />
+                  <span className="text-[11px] hidden sm:inline">Copiar Enlace</span>
+                </>
+              )}
             </button>
           </div>
 

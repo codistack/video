@@ -34,7 +34,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onStartClass }) => {
   const [subject, setSubject] = useState('');
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [time, setTime] = useState('10:00');
-  const [accessMode, setAccessMode] = useState<AccessMode>('permission');
+  const [accessMode, setAccessMode] = useState<AccessMode>('direct');
   const [adminName, setAdminName] = useState('Profesor Admin');
 
   useEffect(() => {
@@ -95,14 +95,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onStartClass }) => {
   };
 
   const getDirectLink = (clsOrCode: ClassSession | string) => {
-    if (typeof clsOrCode === 'object') {
-      return `${window.location.origin}/?room=${encodeURIComponent(clsOrCode.code)}&role=student&title=${encodeURIComponent(clsOrCode.title)}&admin=${encodeURIComponent(clsOrCode.adminName)}&mode=${clsOrCode.accessMode}&subject=${encodeURIComponent(clsOrCode.subject)}`;
-    }
-    const found = classes.find(c => c.code === clsOrCode);
-    if (found) {
-      return `${window.location.origin}/?room=${encodeURIComponent(found.code)}&role=student&title=${encodeURIComponent(found.title)}&admin=${encodeURIComponent(found.adminName)}&mode=${found.accessMode}&subject=${encodeURIComponent(found.subject)}`;
-    }
-    return `${window.location.origin}/?room=${encodeURIComponent(clsOrCode)}&role=student`;
+    return StorageService.getSharableRoomLink(clsOrCode);
   };
 
   const copyToClipboard = (sessionOrCode: ClassSession | string, e: React.MouseEvent) => {
@@ -117,7 +110,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onStartClass }) => {
   const shareViaWhatsApp = (session: ClassSession, e: React.MouseEvent) => {
     e.stopPropagation();
     const link = getDirectLink(session);
-    const text = `🎓 *Invitación a Clase Virtual - EduMeet Pro*\n\n📌 *Tema:* ${session.title}\n📚 *Materia:* ${session.subject}\n📅 *Fecha:* ${session.date} a las ${session.time}\n🔑 *Código de Clase:* ${session.code}\n\n👉 *Unirse con un clic:* ${link}`;
+    const modeLabel = session.accessMode === 'direct' ? 'Ingreso directo con un clic (sin inicio de sesión)' : 'Ingreso con aprobación del docente';
+    const text = `🎓 *Invitación a Clase Virtual - EduMeet Pro*\n\n📌 *Tema:* ${session.title}\n📚 *Materia:* ${session.subject}\n📅 *Fecha:* ${session.date} a las ${session.time}\n🔑 *Código:* ${session.code}\n🛡️ *Acceso:* ${modeLabel}\n\n👉 *Enlace para unirse:* ${link}`;
     const url = `https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`;
     window.open(url, '_blank');
   };
