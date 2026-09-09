@@ -48,6 +48,7 @@ class RealtimeChannelService {
   private heartbeatTimer: number | null = null;
   private reconnectTimer: number | null = null;
   private messageQueue: string[] = [];
+  private mqttQueue: string[] = [];
 
   // Global Multi-Cloud MQTT Relay (Works seamlessly on Vercel, Netlify, Cloud Run, Mobile)
   private mqttClient: MqttClient | null = null;
@@ -68,6 +69,16 @@ class RealtimeChannelService {
        (this.mqttClient && this.mqttConnected) ||
        this.channel)
     ) {
+      // Refresh participant info on server if already connected
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({
+          type: 'SUBSCRIBE',
+          roomCode: cleanRoom,
+          senderId: this.currentSenderId || 'anonymous',
+          payload: this.currentParticipantInfo || { role: 'student', name: 'Usuario' },
+          timestamp: Date.now()
+        }));
+      }
       return;
     }
 
@@ -138,11 +149,28 @@ class RealtimeChannelService {
         client.on('connect', () => {
           this.mqttConnected = true;
           client.subscribe(topic, { qos: 0 });
+
+          // Flush any messages queued before connection established
+          while (this.mqttQueue.length > 0) {
+            const queued = this.mqttQueue.shift();
+            if (queued) {
+              client.publish(topic, queued, { qos: 0 });
+            }
+          }
         });
 
         client.on('message', (_t, messageBuffer) => {
           try {
-            const event: RoomEvent = JSON.parse(messageBuffer.toString());
+            let str = '';
+            if (typeof messageBuffer === 'string') {
+              str = messageBuffer;
+            } else if (messageBuffer && (messageBuffer instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(messageBuffer)))) {
+              str = new TextDecoder('utf-8').decode(messageBuffer);
+            } else {
+              str = String(messageBuffer);
+            }
+
+            const event: RoomEvent = JSON.parse(str);
             if (event && event.roomCode === this.currentRoom) {
               this.notifyListeners(event);
             }
@@ -286,11 +314,16 @@ class RealtimeChannelService {
     }
 
     // 4. Global Multi-Cloud MQTT Relay
-    if (this.mqttClient && this.mqttConnected) {
-      try {
-        this.mqttClient.publish(`edumeet/v2/room/${this.currentRoom}`, rawString, { qos: 0 });
-      } catch (err) {
-        console.warn('Error publishing to MQTT relay:', err);
+    if (this.mqttClient) {
+      if (this.mqttConnected) {
+        try {
+          this.mqttClient.publish(`edumeet/v2/room/${this.currentRoom}`, rawString, { qos: 0 });
+        } catch (err) {
+          console.warn('Error publishing to MQTT relay:', err);
+        }
+      } else {
+        this.mqttQueue.push(rawString);
+        if (this.mqttQueue.length > 50) this.mqttQueue.shift();
       }
     }
   }

@@ -158,15 +158,22 @@ async function startServer() {
     }
   }
 
-  function sendToTarget(roomCode: string, targetId: string, message: string) {
+  function sendToTarget(roomCode: string, targetId: string, message: string, fallbackWs?: ExtendedWebSocket) {
     const cleanRoom = roomCode.toUpperCase();
     const clients = rooms.get(cleanRoom);
     if (!clients) return;
 
+    let delivered = false;
     for (const client of clients) {
       if (client.senderId === targetId && client.readyState === WebSocket.OPEN) {
         client.send(message);
+        delivered = true;
       }
+    }
+
+    // Fallback broadcast if target was not matched by socket senderId
+    if (!delivered && fallbackWs) {
+      broadcastToRoom(cleanRoom, message, fallbackWs);
     }
   }
 
@@ -229,18 +236,16 @@ async function startServer() {
           return;
         }
 
-        // Targeted messaging: WebRTC signaling, direct responses, and admin commands
+        // Targeted messaging: WebRTC peer-to-peer signaling
         const targetId = event.payload?.targetId || event.payload?.targetParticipantId;
         if (targetId && (
           event.type === 'OFFER' ||
           event.type === 'ANSWER' ||
-          event.type === 'ICE_CANDIDATE' ||
-          event.type === 'FORCE_MUTE' ||
-          event.type === 'FORCE_CAMERA_OFF'
+          event.type === 'ICE_CANDIDATE'
         )) {
-          sendToTarget(cleanRoom, targetId, rawString);
+          sendToTarget(cleanRoom, targetId, rawString, ws);
         } else {
-          // Broadcast to all other peers in the room
+          // Broadcast to all other peers in the room (including CHAT_MESSAGE, FORCE_MUTE, FORCE_CAMERA_OFF, PARTICIPANT_UPDATE)
           broadcastToRoom(cleanRoom, rawString, ws);
         }
       } catch (err) {

@@ -48,14 +48,20 @@ const RemoteVideoPlayer: React.FC<{
 
   useEffect(() => {
     if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-      videoRef.current.play().catch(err => console.warn("Remote video playback note:", err));
+      if (videoRef.current.srcObject !== stream) {
+        videoRef.current.srcObject = stream;
+      }
+      if (!isCameraOff) {
+        videoRef.current.play().catch(err => console.warn("Remote video playback note:", err));
+      }
     }
     if (audioRef.current && stream) {
-      audioRef.current.srcObject = stream;
+      if (audioRef.current.srcObject !== stream) {
+        audioRef.current.srcObject = stream;
+      }
       audioRef.current.play().catch(err => console.warn("Remote audio playback note:", err));
     }
-  }, [stream]);
+  }, [stream, isCameraOff]);
 
   return (
     <div className="w-full h-full relative">
@@ -83,41 +89,46 @@ const RemoteVideoPlayer: React.FC<{
   );
 };
 
-// Helper to safely add/replace tracks on RTCPeerConnection
+// Helper to safely add/replace tracks on RTCPeerConnection using WebRTC Transceivers
 const syncPeerConnectionTracks = (
   pc: RTCPeerConnection,
   vStream: MediaStream | null,
   mStream: MediaStream | null
 ) => {
-  const activeVideoTrack = vStream?.getVideoTracks()[0] || mStream?.getVideoTracks()[0] || null;
-  const activeAudioTrack = mStream?.getAudioTracks()[0] || null;
+  const activeVideoTrack = vStream?.getVideoTracks().find(t => t.readyState === 'live') || 
+                           mStream?.getVideoTracks().find(t => t.readyState === 'live') || null;
+  const activeAudioTrack = mStream?.getAudioTracks().find(t => t.readyState === 'live') || null;
 
-  const senders = pc.getSenders();
-
-  if (activeVideoTrack) {
-    const videoSender = senders.find(s => s.track?.kind === 'video');
-    if (videoSender) {
-      videoSender.replaceTrack(activeVideoTrack).catch(e => console.warn("replaceTrack video error:", e));
-    } else {
-      try {
-        const streamToUse = vStream || mStream;
-        if (streamToUse) pc.addTrack(activeVideoTrack, streamToUse);
-      } catch (e) {
-        console.warn("addTrack video error:", e);
-      }
+  // Video track handling via transceiver
+  const videoTransceiver = pc.getTransceivers().find(t =>
+    t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video'
+  );
+  if (videoTransceiver) {
+    if (activeVideoTrack && videoTransceiver.sender.track !== activeVideoTrack) {
+      videoTransceiver.sender.replaceTrack(activeVideoTrack).catch(e => console.warn("replaceTrack video error:", e));
+    }
+  } else if (activeVideoTrack) {
+    try {
+      const streamToUse = vStream || mStream;
+      if (streamToUse) pc.addTrack(activeVideoTrack, streamToUse);
+    } catch (e) {
+      console.warn("addTrack video error:", e);
     }
   }
 
-  if (activeAudioTrack) {
-    const audioSender = senders.find(s => s.track?.kind === 'audio');
-    if (audioSender) {
-      audioSender.replaceTrack(activeAudioTrack).catch(e => console.warn("replaceTrack audio error:", e));
-    } else {
-      try {
-        if (mStream) pc.addTrack(activeAudioTrack, mStream);
-      } catch (e) {
-        console.warn("addTrack audio error:", e);
-      }
+  // Audio track handling via transceiver
+  const audioTransceiver = pc.getTransceivers().find(t =>
+    t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio'
+  );
+  if (audioTransceiver) {
+    if (activeAudioTrack && audioTransceiver.sender.track !== activeAudioTrack) {
+      audioTransceiver.sender.replaceTrack(activeAudioTrack).catch(e => console.warn("replaceTrack audio error:", e));
+    }
+  } else if (activeAudioTrack) {
+    try {
+      if (mStream) pc.addTrack(activeAudioTrack, mStream);
+    } catch (e) {
+      console.warn("addTrack audio error:", e);
     }
   }
 };
@@ -254,8 +265,9 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
 
-  // WebRTC Peer Connections Ref
+  // WebRTC Peer Connections & DataChannels Ref
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
   const iceCandidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
   // Video Element Refs
@@ -266,6 +278,51 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   const [copiedCode, setCopiedCode] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const roomContainerRef = useRef<HTMLDivElement>(null);
+
+  // Broadcast event directly over WebRTC DataChannels to all connected peers
+  const broadcastP2P = (event: RoomEvent) => {
+    const raw = JSON.stringify(event);
+    dataChannelsRef.current.forEach((dc) => {
+      if (dc.readyState === 'open') {
+        try {
+          dc.send(raw);
+        } catch (e) {
+          console.warn('[WebRTC DataChannel] Send error:', e);
+        }
+      }
+    });
+  };
+
+  const setupDataChannel = (remotePeerId: string, channel: RTCDataChannel) => {
+    channel.onopen = () => {
+      console.log(`[WebRTC DataChannel] Connection opened with peer ${remotePeerId}`);
+    };
+    channel.onmessage = (e) => {
+      try {
+        let str = '';
+        if (typeof e.data === 'string') {
+          str = e.data;
+        } else if (e.data instanceof ArrayBuffer) {
+          str = new TextDecoder('utf-8').decode(e.data);
+        } else {
+          str = String(e.data);
+        }
+        const event: RoomEvent = JSON.parse(str);
+        if (event && event.roomCode === classSession.code && event.senderId !== userId) {
+          handleIncomingRoomEventRef.current?.(event);
+        }
+      } catch (err) {
+        console.warn('[WebRTC DataChannel] Parse error:', err);
+      }
+    };
+    channel.onclose = () => {
+      dataChannelsRef.current.delete(remotePeerId);
+    };
+    dataChannelsRef.current.set(remotePeerId, channel);
+  };
+
+  // Ref holder to break circular dependency between createPeerConnection and handleIncomingRoomEvent
+  const handleIncomingRoomEventRef = useRef<((event: RoomEvent) => void) | null>(null);
 
   // 1. Initialize Local Media Stream
   useEffect(() => {
@@ -327,6 +384,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       }
       existing.close();
       peerConnectionsRef.current.delete(targetId);
+      dataChannelsRef.current.delete(targetId);
     }
 
     const rtcConfig: RTCConfiguration = {
@@ -344,6 +402,19 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnectionsRef.current.set(targetId, pc);
+
+    // Setup direct WebRTC DataChannel
+    if (isOfferer) {
+      try {
+        const dc = pc.createDataChannel('edumeet_p2p', { ordered: true });
+        setupDataChannel(targetId, dc);
+      } catch (e) {
+        console.warn('Could not create data channel:', e);
+      }
+    }
+    pc.ondatachannel = (event) => {
+      setupDataChannel(targetId, event.channel);
+    };
 
     // Ensure audio & video transceivers exist so streams negotiate properly in both directions
     try {
@@ -367,22 +438,19 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     };
 
     pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        const rStream = event.streams[0];
-        setRemoteStreams(prev => {
-          const next = new Map(prev);
-          next.set(targetId, rStream);
-          return next;
-        });
-      } else if (event.track) {
-        setRemoteStreams(prev => {
-          const existing = prev.get(targetId) || new MediaStream();
-          existing.addTrack(event.track);
-          const next = new Map(prev);
-          next.set(targetId, existing);
-          return next;
-        });
-      }
+      setRemoteStreams(prev => {
+        let stream = prev.get(targetId);
+        if (!stream) {
+          stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream();
+        }
+        if (event.track && !stream.getTracks().some(t => t.id === event.track.id)) {
+          stream.addTrack(event.track);
+        }
+        const next = new Map(prev);
+        // Fresh MediaStream instance with all tracks so React components detect state change
+        next.set(targetId, new MediaStream(stream.getTracks()));
+        return next;
+      });
     };
 
     if (isOfferer) {
@@ -491,13 +559,13 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     };
     setChatMessages([initialSysMessage]);
 
-    // Subscribe to incoming events
-    const unsub = realtimeService.subscribe('*', (event) => {
-      if (event.senderId === userId) return; // Ignore self events
+    // Handler for all incoming events from realtimeService and WebRTC DataChannels
+    const handleIncomingRoomEvent = (event: RoomEvent) => {
+      if (!event || event.senderId === userId) return; // Ignore self events
 
       switch (event.type) {
         case 'ROOM_SYNC': {
-          realtimeService.send('PARTICIPANT_UPDATE', userId, {
+          const syncUpdate = {
             id: userId,
             name: userName,
             role: userRole,
@@ -506,6 +574,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             isCameraOff: isCameraOffRef.current,
             isScreenSharing: isScreenSharingRef.current,
             joinedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          };
+          realtimeService.send('PARTICIPANT_UPDATE', userId, syncUpdate);
+          broadcastP2P({
+            type: 'PARTICIPANT_UPDATE',
+            roomCode: classSession.code,
+            senderId: userId,
+            payload: syncUpdate,
+            timestamp: Date.now()
           });
           break;
         }
@@ -557,10 +633,12 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
         case 'PARTICIPANT_UPDATE': {
           const remoteP: Participant = event.payload;
+          if (!remoteP || !remoteP.id) break;
+
           setParticipants(prev => {
             const exists = prev.find(p => p.id === remoteP.id);
             if (exists) {
-              return prev.map(p => p.id === remoteP.id ? { ...p, ...remoteP } : p);
+              return prev.map(p => (p.id === remoteP.id ? { ...p, ...remoteP } : p));
             } else {
               return [...prev, { ...remoteP, status: 'active' }];
             }
@@ -664,8 +742,13 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         }
 
         case 'FORCE_MUTE': {
-          if (event.payload.targetParticipantId === userId) {
+          const target = event.payload?.targetParticipantId || event.payload?.targetId;
+          if (target === userId) {
             setIsMuted(true);
+            isMutedRef.current = true;
+            if (localStreamRef.current) {
+              localStreamRef.current.getAudioTracks().forEach(t => (t.enabled = false));
+            }
             const sysMuteMsg: ChatMessage = {
               id: 'mute-' + Date.now(),
               senderId: 'system',
@@ -676,13 +759,37 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
               isSystem: true
             };
             setChatMessages(prev => [...prev, sysMuteMsg]);
+
+            // Notify everyone immediately that local state is muted
+            const updatePayload = {
+              id: userId,
+              name: userName,
+              role: userRole,
+              isMuted: true,
+              isCameraOff: isCameraOffRef.current,
+              isScreenSharing: isScreenSharingRef.current
+            };
+            realtimeService.send('PARTICIPANT_UPDATE', userId, updatePayload);
+            broadcastP2P({
+              type: 'PARTICIPANT_UPDATE',
+              roomCode: classSession.code,
+              senderId: userId,
+              payload: updatePayload,
+              timestamp: Date.now()
+            });
           }
+          setParticipants(prev => prev.map(p => (p.id === target ? { ...p, isMuted: true } : p)));
           break;
         }
 
         case 'FORCE_CAMERA_OFF': {
-          if (event.payload.targetParticipantId === userId) {
+          const target = event.payload?.targetParticipantId || event.payload?.targetId;
+          if (target === userId) {
             setIsCameraOff(true);
+            isCameraOffRef.current = true;
+            if (localStreamRef.current) {
+              localStreamRef.current.getVideoTracks().forEach(t => (t.enabled = false));
+            }
             const sysCamMsg: ChatMessage = {
               id: 'cam-' + Date.now(),
               senderId: 'system',
@@ -693,13 +800,35 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
               isSystem: true
             };
             setChatMessages(prev => [...prev, sysCamMsg]);
+
+            const updatePayload = {
+              id: userId,
+              name: userName,
+              role: userRole,
+              isMuted: isMutedRef.current,
+              isCameraOff: true,
+              isScreenSharing: isScreenSharingRef.current
+            };
+            realtimeService.send('PARTICIPANT_UPDATE', userId, updatePayload);
+            broadcastP2P({
+              type: 'PARTICIPANT_UPDATE',
+              roomCode: classSession.code,
+              senderId: userId,
+              payload: updatePayload,
+              timestamp: Date.now()
+            });
           }
+          setParticipants(prev => prev.map(p => (p.id === target ? { ...p, isCameraOff: true } : p)));
           break;
         }
 
         case 'CHAT_MESSAGE': {
           const newMsg: ChatMessage = event.payload;
-          setChatMessages(prev => [...prev, newMsg]);
+          if (!newMsg || !newMsg.id) break;
+          setChatMessages(prev => {
+            if (prev.some(m => m.id === newMsg.id)) return prev;
+            return [...prev, newMsg];
+          });
           if (!showChat) {
             setUnreadChatCount(prev => prev + 1);
           }
@@ -719,6 +848,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             pc.close();
             peerConnectionsRef.current.delete(targetId);
           }
+          dataChannelsRef.current.delete(targetId);
           iceCandidateQueueRef.current.delete(targetId);
           setRemoteStreams(prev => {
             const next = new Map(prev);
@@ -732,14 +862,22 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         default:
           break;
       }
-    });
+    };
+
+    handleIncomingRoomEventRef.current = handleIncomingRoomEvent;
+
+    // Subscribe to incoming events
+    const unsub = realtimeService.subscribe('*', handleIncomingRoomEvent);
 
     return () => {
       clearTimeout(retryTimer1);
       clearTimeout(retryTimer2);
       unsub();
+      handleIncomingRoomEventRef.current = null;
       peerConnectionsRef.current.forEach(pc => pc.close());
       peerConnectionsRef.current.clear();
+      dataChannelsRef.current.forEach(dc => dc.close());
+      dataChannelsRef.current.clear();
       iceCandidateQueueRef.current.clear();
       realtimeService.send('PARTICIPANT_LEAVE', userId, { id: userId });
       realtimeService.leave();
@@ -860,14 +998,116 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   // 6. Admin Remote Control Handlers
   const handleRemoteMuteParticipant = (targetId: string) => {
     if (userRole !== 'admin') return;
-    realtimeService.send('FORCE_MUTE', userId, { targetParticipantId: targetId });
+    const payload = { targetParticipantId: targetId, targetId: targetId };
+    realtimeService.send('FORCE_MUTE', userId, payload);
+    broadcastP2P({
+      type: 'FORCE_MUTE',
+      roomCode: classSession.code,
+      senderId: userId,
+      payload,
+      timestamp: Date.now()
+    });
     setParticipants(prev => prev.map(p => p.id === targetId ? { ...p, isMuted: true } : p));
   };
 
   const handleRemoteTurnOffCamera = (targetId: string) => {
     if (userRole !== 'admin') return;
-    realtimeService.send('FORCE_CAMERA_OFF', userId, { targetParticipantId: targetId });
+    const payload = { targetParticipantId: targetId, targetId: targetId };
+    realtimeService.send('FORCE_CAMERA_OFF', userId, payload);
+    broadcastP2P({
+      type: 'FORCE_CAMERA_OFF',
+      roomCode: classSession.code,
+      senderId: userId,
+      payload,
+      timestamp: Date.now()
+    });
     setParticipants(prev => prev.map(p => p.id === targetId ? { ...p, isCameraOff: true } : p));
+  };
+
+  // Dedicated toggles to guarantee camera and mic track re-acquisition & WebRTC renegotiation
+  const toggleMic = async () => {
+    if (isMuted) {
+      const audTrack = localStream?.getAudioTracks().find(t => t.readyState === 'live');
+      if (audTrack) {
+        audTrack.enabled = true;
+        setIsMuted(false);
+      } else {
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          const newAud = micStream.getAudioTracks()[0];
+          if (newAud) {
+            newAud.enabled = true;
+            if (localStream) {
+              localStream.getAudioTracks().forEach(t => {
+                localStream.removeTrack(t);
+                t.stop();
+              });
+              localStream.addTrack(newAud);
+              const fresh = new MediaStream(localStream.getTracks());
+              setLocalStream(fresh);
+              localStreamRef.current = fresh;
+            } else {
+              setLocalStream(micStream);
+              localStreamRef.current = micStream;
+            }
+            setIsMuted(false);
+          }
+        } catch (err) {
+          console.warn("Could not activate mic:", err);
+          alert("No se pudo reactivar el micrófono. Revisa los permisos del navegador.");
+          return;
+        }
+      }
+    } else {
+      if (localStream) {
+        localStream.getAudioTracks().forEach(t => (t.enabled = false));
+      }
+      setIsMuted(true);
+    }
+  };
+
+  const toggleCamera = async () => {
+    if (isCameraOff) {
+      const vidTrack = localStream?.getVideoTracks().find(t => t.readyState === 'live');
+      if (vidTrack) {
+        vidTrack.enabled = true;
+        setIsCameraOff(false);
+      } else {
+        try {
+          const camStream = await navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+            audio: false
+          });
+          const newVid = camStream.getVideoTracks()[0];
+          if (newVid) {
+            newVid.enabled = true;
+            if (localStream) {
+              localStream.getVideoTracks().forEach(t => {
+                localStream.removeTrack(t);
+                t.stop();
+              });
+              localStream.addTrack(newVid);
+              const fresh = new MediaStream(localStream.getTracks());
+              setLocalStream(fresh);
+              localStreamRef.current = fresh;
+            } else {
+              setLocalStream(camStream);
+              localStreamRef.current = camStream;
+            }
+            setIsCameraOff(false);
+          }
+        } catch (err) {
+          console.warn("Could not activate camera:", err);
+          alert("No se pudo encender la cámara. Revisa los permisos del navegador.");
+          return;
+        }
+      }
+    } else {
+      if (localStream) {
+        localStream.getVideoTracks().forEach(t => (t.enabled = false));
+      }
+      setIsCameraOff(true);
+    }
   };
 
   const handleAcceptStudent = (studentId: string) => {
@@ -931,6 +1171,13 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     };
     setChatMessages(prev => [...prev, newMsg]);
     realtimeService.send('CHAT_MESSAGE', userId, newMsg);
+    broadcastP2P({
+      type: 'CHAT_MESSAGE',
+      roomCode: classSession.code,
+      senderId: userId,
+      payload: newMsg,
+      timestamp: Date.now()
+    });
   };
 
   const copyRoomLink = () => {
@@ -1110,6 +1357,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
                           <span className="text-xs text-indigo-300 font-semibold block">Cámara Simulada HD</span>
                         </div>
                       </div>
+                    ) : !p.isCameraOff ? (
+                      /* Remote participant turned on camera: connecting/renegotiating stream */
+                      <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900/95 text-indigo-300 gap-3">
+                        <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white text-2xl font-extrabold shadow-lg shadow-indigo-600/30 animate-pulse">
+                          {p.name.charAt(0).toUpperCase()}
+                        </div>
+                        <span className="text-xs text-indigo-400 font-medium animate-pulse">Cámara Encendida · Conectando video...</span>
+                      </div>
                     ) : (
                       /* Camera Off Avatar Placeholder */
                       <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900/90 text-slate-400 gap-3">
@@ -1131,9 +1386,35 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
                       )}
                     </div>
 
-                    {/* Mic Muted Badge */}
-                    <div className="absolute top-3 right-3 flex items-center gap-1.5">
-                      {p.isMuted && (
+                    {/* Top Right Controls & Muted Badge */}
+                    <div className="absolute top-3 right-3 flex items-center gap-1.5 z-20">
+                      {userRole === 'admin' && !isMe && (
+                        <div className="flex items-center gap-1 bg-slate-950/85 backdrop-blur-md p-1 rounded-xl border border-slate-700/80 shadow-lg">
+                          <button
+                            onClick={() => handleRemoteMuteParticipant(p.id)}
+                            className={`p-1.5 rounded-lg text-xs transition cursor-pointer ${
+                              p.isMuted
+                                ? 'bg-rose-600 text-white hover:bg-rose-500'
+                                : 'bg-slate-800 text-slate-300 hover:text-rose-400 hover:bg-slate-700'
+                            }`}
+                            title={p.isMuted ? 'Micrófono Silenciado (Click para silenciar de nuevo)' : 'Silenciar micrófono del estudiante'}
+                          >
+                            {p.isMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                          </button>
+                          <button
+                            onClick={() => handleRemoteTurnOffCamera(p.id)}
+                            className={`p-1.5 rounded-lg text-xs transition cursor-pointer ${
+                              p.isCameraOff
+                                ? 'bg-rose-600 text-white hover:bg-rose-500'
+                                : 'bg-slate-800 text-slate-300 hover:text-rose-400 hover:bg-slate-700'
+                            }`}
+                            title={p.isCameraOff ? 'Cámara Apagada' : 'Apagar cámara del estudiante'}
+                          >
+                            {p.isCameraOff ? <VideoOff className="w-3.5 h-3.5" /> : <Video className="w-3.5 h-3.5" />}
+                          </button>
+                        </div>
+                      )}
+                      {!(userRole === 'admin' && !isMe) && p.isMuted && (
                         <div className="bg-rose-600/90 text-white p-1.5 rounded-xl border border-rose-500 shadow-md" title="Micrófono Silenciado">
                           <MicOff className="w-3.5 h-3.5" />
                         </div>
@@ -1194,7 +1475,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
           <div className="flex items-center gap-3">
             {/* Mic Toggle */}
             <button
-              onClick={() => setIsMuted(!isMuted)}
+              onClick={toggleMic}
               className={`p-3.5 rounded-2xl border transition shadow-xl cursor-pointer ${
                 isMuted
                   ? 'bg-rose-600 border-rose-500 text-white hover:bg-rose-500 shadow-rose-600/20'
@@ -1207,7 +1488,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
             {/* Camera Toggle */}
             <button
-              onClick={() => setIsCameraOff(!isCameraOff)}
+              onClick={toggleCamera}
               className={`p-3.5 rounded-2xl border transition shadow-xl cursor-pointer ${
                 isCameraOff
                   ? 'bg-rose-600 border-rose-500 text-white hover:bg-rose-500 shadow-rose-600/20'
