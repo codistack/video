@@ -286,11 +286,11 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
         {/* Header */}
         <div className="text-center space-y-2">
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-xs font-semibold">
-            <Sparkles className="w-3.5 h-3.5" /> Ingreso a Clase Virtual
+            <Sparkles className="w-3.5 h-3.5" /> Acceso Controlado por el Profesor
           </div>
-          <h1 className="text-3xl font-extrabold text-white">Preparar Audio y Video</h1>
+          <h1 className="text-3xl font-extrabold text-white">Sala de Espera</h1>
           <p className="text-slate-400 text-xs sm:text-sm">
-            Verifica tu cámara y micrófono e ingresa tus datos antes de entrar a la sala.
+            El profesor verificará tu ingreso en la sala. No requiere registro ni inicio de sesión.
           </p>
         </div>
 

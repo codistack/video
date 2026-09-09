@@ -18,12 +18,58 @@ export function App() {
     const roomParam = params.get('room');
     const roleParam = params.get('role');
 
-    if (roomParam) {
-      setUrlRoomCode(roomParam);
-      setCurrentRole('student'); // Default to student when arriving via room link
-    } else if (roleParam === 'student') {
-      setCurrentRole('student');
+    if (!roomParam) {
+      if (roleParam === 'student') {
+        setCurrentRole('student');
+      }
+      return;
     }
+
+    const cleanCode = roomParam.trim().toUpperCase();
+    const titleParam = params.get('title') || `Clase ${cleanCode}`;
+    const adminParam = params.get('admin') || 'Docente';
+    const modeParam = (params.get('mode') as 'direct' | 'permission') || 'direct';
+    const subjectParam = params.get('subject') || 'Reunión Virtual';
+    const nameParam = params.get('name');
+
+    const resolveAndJoin = async () => {
+      let session: ClassSession | null = await StorageService.fetchClassByCode(cleanCode);
+      if (!session) {
+        session = {
+          id: 'url-' + cleanCode,
+          code: cleanCode,
+          title: titleParam,
+          subject: subjectParam,
+          date: new Date().toISOString().split('T')[0],
+          time: 'Ahora',
+          accessMode: modeParam,
+          adminName: adminParam,
+          createdAt: new Date().toISOString(),
+          status: 'live'
+        };
+        StorageService.addClass(session);
+      }
+
+      // If accessMode is 'direct': join ConferenceRoom immediately with NO login, registration or forms!
+      if (session.accessMode === 'direct') {
+        const studentName = nameParam || StorageService.getUserName() || `Estudiante ${Math.floor(100 + Math.random() * 900)}`;
+        StorageService.setUserName(studentName);
+        setActiveSession(session);
+        setCurrentRole('student');
+        setPreCallSettings({
+          name: studentName,
+          isMuted: false,
+          isCameraOff: false,
+          participantId: 'usr-' + Math.random().toString(36).substr(2, 6)
+        });
+      } else {
+        // If accessMode is 'permission': show waiting room for teacher approval
+        setUrlRoomCode(cleanCode);
+        setCurrentRole('student');
+      }
+    };
+
+    resolveAndJoin();
   }, []);
 
   const handleStartClassAsAdmin = (session: ClassSession) => {

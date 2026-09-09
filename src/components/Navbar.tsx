@@ -32,29 +32,9 @@ export const Navbar: React.FC<NavbarProps> = ({ currentRole, onSwitchRole, inCal
         {/* Navigation & Controls */}
         <div className="flex items-center gap-3">
           {!inCall && (
-            <div className="flex items-center bg-slate-900/90 border border-slate-800 rounded-xl p-1 shadow-inner">
-              <button
-                onClick={() => onSwitchRole?.('admin')}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  currentRole === 'admin'
-                    ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-md shadow-indigo-600/30'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <Shield className="w-3.5 h-3.5" />
-                <span>Modo Admin</span>
-              </button>
-              <button
-                onClick={() => onSwitchRole?.('student')}
-                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  currentRole === 'student'
-                    ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-md shadow-indigo-600/30'
-                    : 'text-slate-400 hover:text-white'
-                }`}
-              >
-                <User className="w-3.5 h-3.5" />
-                <span>Modo Estudiante</span>
-              </button>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-xs font-semibold text-emerald-400">
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Acceso directo por enlace · Sin registro ni inicio de sesión</span>
             </div>
           )}
 
@@ -63,7 +43,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentRole, onSwitchRole, inCal
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
               <span className="font-semibold text-emerald-400">En Sesión</span>
               <span className="text-slate-500">|</span>
-              <span className="text-slate-400 capitalize">{currentRole === 'admin' ? 'Profesor / Admin' : 'Estudiante'}</span>
+              <span className="text-slate-400 capitalize">{currentRole === 'admin' ? 'Profesor' : 'Estudiante'}</span>
             </div>
           )}
         </div>
