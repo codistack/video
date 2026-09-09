@@ -69,6 +69,8 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     return () => unsubClassInfo();
   }, [initialRoomCode]);
 
+  const hasProceededRef = useRef(false);
+
   // Handle local camera preview
   useEffect(() => {
     let activeStream: MediaStream | null = null;
@@ -76,7 +78,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     const startPreview = async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
           audio: true
         });
         activeStream = stream;
@@ -94,7 +96,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     startPreview();
 
     return () => {
-      if (activeStream) {
+      if (activeStream && !hasProceededRef.current) {
         activeStream.getTracks().forEach(track => track.stop());
       }
     };
@@ -173,16 +175,20 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
   const studentIdRef = useRef('usr-' + Math.random().toString(36).substr(2, 6)).current;
 
   const handleProceedToRoom = (session: ClassSession) => {
+    hasProceededRef.current = true;
+
+    // Apply mute/camera preferences directly to live tracks before handing over
     if (mediaStream) {
-      mediaStream.getTracks().forEach(t => t.stop());
-      setMediaStream(null);
+      mediaStream.getAudioTracks().forEach(t => (t.enabled = !isMuted));
+      mediaStream.getVideoTracks().forEach(t => (t.enabled = !isCameraOff));
     }
 
     onJoinRoom(session, studentName.trim(), {
       name: studentName.trim(),
       isMuted,
       isCameraOff,
-      participantId: studentIdRef
+      participantId: studentIdRef,
+      initialStream: mediaStream
     });
   };
 

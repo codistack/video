@@ -49,4 +49,5 @@ export interface PreCallSettings {
   isMuted: boolean;
   isCameraOff: boolean;
   participantId?: string;
+  initialStream?: MediaStream | null;
 }
