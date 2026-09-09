@@ -179,7 +179,11 @@ class RealtimeChannelService {
   }
 
   private notifyListeners(event: RoomEvent): void {
-    const eventId = `${event.senderId}_${event.type}_${event.timestamp}_${JSON.stringify(event.payload).length}`;
+    // Build a stable event ID using sender + type + timestamp
+    // Previously used payload length which caused false duplicate detection
+    // (two different events with same-length payloads would be dropped)
+    const payloadStr = JSON.stringify(event.payload);
+    const eventId = `${event.senderId}_${event.type}_${event.timestamp}_${payloadStr.slice(0, 64)}`;
     if (this.processedEvents.has(eventId)) {
       return; // Ignore duplicate event received over local + cloud channels
     }

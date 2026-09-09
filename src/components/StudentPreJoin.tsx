@@ -103,6 +103,8 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
       setFoundClass(cls);
     } else if (code.trim().length > 0) {
       // Create ad-hoc session if code exists but not stored locally
+      // Use 'direct' access mode so students can join without approval
+      // when no matching class is found in this browser's storage
       const adHoc: ClassSession = {
         id: 'adhoc-' + code,
         code: code.trim().toUpperCase(),
@@ -110,7 +112,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
         subject: 'Reunión Virtual',
         date: new Date().toISOString().split('T')[0],
         time: 'Ahora',
-        accessMode: 'direct', // Default to direct for custom room codes
+        accessMode: 'direct',
         adminName: 'Docente',
         createdAt: new Date().toISOString(),
         status: 'live'

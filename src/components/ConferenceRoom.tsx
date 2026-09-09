@@ -207,6 +207,18 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   const [isCameraOff, setIsCameraOff] = useState(preCallSettings.isCameraOff);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
 
+  // ---- Live-value refs so event handlers always read current state (avoids stale closures) ----
+  const isMutedRef = useRef(preCallSettings.isMuted);
+  const isCameraOffRef = useRef(preCallSettings.isCameraOff);
+  const isScreenSharingRef = useRef(false);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+
+  // Keep refs in sync with state
+  useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
+  useEffect(() => { isCameraOffRef.current = isCameraOff; }, [isCameraOff]);
+  useEffect(() => { isScreenSharingRef.current = isScreenSharing; }, [isScreenSharing]);
+
   // Room Features State
   const [showChat, setShowChat] = useState(false);
   const [showParticipants, setShowParticipants] = useState(false);
@@ -255,6 +267,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
           audio: true
         });
         activeStream = stream;
+        localStreamRef.current = stream;
         setLocalStream(stream);
 
         // Apply initial mute/camera state
@@ -271,6 +284,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       if (activeStream) {
         activeStream.getTracks().forEach(track => track.stop());
       }
+      localStreamRef.current = null;
     };
   }, []);
 
@@ -289,13 +303,15 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     }
   }, [screenStream, isScreenSharing]);
 
-  // 2. WebRTC Peer Connection Helper
+  // 2. WebRTC Peer Connection Helper — reads from refs to avoid stale closures
   const createPeerConnection = (targetId: string, isOfferer: boolean): RTCPeerConnection => {
     const existing = peerConnectionsRef.current.get(targetId);
     if (existing) {
       if (existing.connectionState !== 'failed' && existing.connectionState !== 'closed') {
-        const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
-        syncPeerConnectionTracks(existing, activeVideoStream, localStream);
+        const liveLocal = localStreamRef.current;
+        const liveScreen = screenStreamRef.current;
+        const activeVideoStream = (isScreenSharingRef.current && liveScreen) ? liveScreen : liveLocal;
+        syncPeerConnectionTracks(existing, activeVideoStream, liveLocal);
         return existing;
       }
       existing.close();
@@ -313,9 +329,11 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnectionsRef.current.set(targetId, pc);
 
-    // Add / sync local tracks
-    const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
-    syncPeerConnectionTracks(pc, activeVideoStream, localStream);
+    // Add / sync local tracks using live ref values (not stale closure state)
+    const liveLocal = localStreamRef.current;
+    const liveScreen = screenStreamRef.current;
+    const activeVideoStream = (isScreenSharingRef.current && liveScreen) ? liveScreen : liveLocal;
+    syncPeerConnectionTracks(pc, activeVideoStream, liveLocal);
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -359,6 +377,10 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       localStream.getVideoTracks().forEach(t => t.enabled = !isCameraOff);
     }
 
+    // Keep stream refs in sync whenever streams change
+    localStreamRef.current = localStream;
+    screenStreamRef.current = screenStream;
+
     peerConnectionsRef.current.forEach((pc) => {
       const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
       syncPeerConnectionTracks(pc, activeVideoStream, localStream);
@@ -394,8 +416,40 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     setParticipants([myParticipant]);
 
     // Broadcast join and request sync from existing peers
+    // Send immediately via BroadcastChannel (same browser) and WS (cross-device)
     realtimeService.send('PARTICIPANT_UPDATE', userId, myParticipant);
     realtimeService.send('ROOM_SYNC', userId, { requestSync: true });
+
+    // Re-broadcast after short delays to handle WS relay connection timing:
+    // PieSocket WS may still be connecting when we first join, so the first
+    // broadcast may only reach same-browser tabs. Re-sending ensures cross-device
+    // participants (teacher on different machine) will receive our presence.
+    const retryTimer1 = window.setTimeout(() => {
+      realtimeService.send('PARTICIPANT_UPDATE', userId, {
+        id: userId,
+        name: userName,
+        role: userRole,
+        status: 'active',
+        isMuted: isMutedRef.current,
+        isCameraOff: isCameraOffRef.current,
+        isScreenSharing: isScreenSharingRef.current,
+        joinedAt: myParticipant.joinedAt
+      });
+      realtimeService.send('ROOM_SYNC', userId, { requestSync: true });
+    }, 1500);
+
+    const retryTimer2 = window.setTimeout(() => {
+      realtimeService.send('PARTICIPANT_UPDATE', userId, {
+        id: userId,
+        name: userName,
+        role: userRole,
+        status: 'active',
+        isMuted: isMutedRef.current,
+        isCameraOff: isCameraOffRef.current,
+        isScreenSharing: isScreenSharingRef.current,
+        joinedAt: myParticipant.joinedAt
+      });
+    }, 4000);
 
     const initialSysMessage: ChatMessage = {
       id: 'sys-' + Date.now(),
@@ -414,15 +468,17 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
       switch (event.type) {
         case 'ROOM_SYNC': {
-          // Send our current participant info so the newly joined peer receives it
+          // Send current participant info using REFS (avoids stale closure problem)
+          // Without refs, admin would always respond with values from mount-time,
+          // causing the teacher to appear invisible to newly-joining students.
           realtimeService.send('PARTICIPANT_UPDATE', userId, {
             id: userId,
             name: userName,
             role: userRole,
             status: 'active',
-            isMuted,
-            isCameraOff,
-            isScreenSharing,
+            isMuted: isMutedRef.current,
+            isCameraOff: isCameraOffRef.current,
+            isScreenSharing: isScreenSharingRef.current,
             joinedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           });
           break;
@@ -560,6 +616,8 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     });
 
     return () => {
+      clearTimeout(retryTimer1);
+      clearTimeout(retryTimer2);
       unsub();
       peerConnectionsRef.current.forEach(pc => pc.close());
       peerConnectionsRef.current.clear();
