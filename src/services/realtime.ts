@@ -31,15 +31,25 @@ class RealtimeChannelService {
   private storageListener: ((e: StorageEvent) => void) | null = null;
   private processedEvents: Set<string> = new Set();
 
+  // Public WebSocket Relay for Cross-Device / Internet Signaling (Vercel)
+  private wsRelay: WebSocket | null = null;
+  private heartbeatTimer: number | null = null;
+
   public init(roomCode: string): void {
     const cleanRoom = roomCode.toUpperCase().trim();
-    if (this.currentRoom === cleanRoom && this.channel) return;
+    if (
+      this.currentRoom === cleanRoom &&
+      (this.channel || (this.wsRelay && this.wsRelay.readyState === WebSocket.OPEN))
+    ) {
+      return;
+    }
 
     this.leave();
 
     this.currentRoom = cleanRoom;
     this.processedEvents.clear();
 
+    // 1. BroadcastChannel (Same Browser Multi-Tab Sync)
     try {
       this.channel = new BroadcastChannel(`edumeet_room_${cleanRoom}`);
       this.channel.onmessage = (e: MessageEvent<RoomEvent>) => {
@@ -48,10 +58,10 @@ class RealtimeChannelService {
         }
       };
     } catch (err) {
-      console.warn('BroadcastChannel not available, relying on localStorage events:', err);
+      console.warn('BroadcastChannel not available:', err);
     }
 
-    // Fallback/secondary listener using window storage event
+    // 2. localStorage Storage Event (Same Machine Multi-Window Fallback)
     this.storageListener = (e: StorageEvent) => {
       if (e.key === `edumeet_event_${cleanRoom}` && e.newValue) {
         try {
@@ -60,11 +70,56 @@ class RealtimeChannelService {
             this.notifyListeners(event);
           }
         } catch (err) {
-          // ignore parse errors
+          // ignore
         }
       }
     };
     window.addEventListener('storage', this.storageListener);
+
+    // 3. Internet WebSocket Relay (For Vercel / Cross-Device Worldwide Connections)
+    this.connectWebSocketRelay(cleanRoom);
+  }
+
+  private connectWebSocketRelay(roomCode: string): void {
+    try {
+      // PieSocket Public Relay channel for this specific room code
+      const apiKey = 'VCWS5aCouB5wBxcmhfPpRR9moEJu-nWKfkBXBSLR';
+      const wsUrl = `wss://relay.piesocket.com/v3/edumeet_${roomCode.toLowerCase()}?api_key=${apiKey}&notify_self=0`;
+
+      const ws = new WebSocket(wsUrl);
+      this.wsRelay = ws;
+
+      ws.onopen = () => {
+        // Send periodic ping to keep cloud WebSocket connection active
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = window.setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'PING', roomCode }));
+          }
+        }, 20000);
+      };
+
+      ws.onmessage = (msgEvent: MessageEvent) => {
+        try {
+          const event: RoomEvent = JSON.parse(msgEvent.data);
+          if (event && event.roomCode === this.currentRoom && event.type !== 'PING') {
+            this.notifyListeners(event);
+          }
+        } catch (err) {
+          // ignore non-JSON or ping frames
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.warn('[Realtime] Cloud WebSocket Relay warning:', err);
+      };
+
+      ws.onclose = () => {
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      };
+    } catch (err) {
+      console.warn('[Realtime] Could not initialize Cloud WebSocket Relay:', err);
+    }
   }
 
   public send(type: EventType, senderId: string, payload: any): void {
@@ -78,7 +133,7 @@ class RealtimeChannelService {
       timestamp: Date.now()
     };
 
-    // 1. Post to BroadcastChannel
+    // 1. Local BroadcastChannel
     if (this.channel) {
       try {
         this.channel.postMessage(event);
@@ -87,7 +142,7 @@ class RealtimeChannelService {
       }
     }
 
-    // 2. Post to localStorage for cross-window / tab fallback with unique nonce
+    // 2. Local localStorage
     try {
       const storageKey = `edumeet_event_${this.currentRoom}`;
       const payloadWithNonce = JSON.stringify({
@@ -96,7 +151,16 @@ class RealtimeChannelService {
       });
       localStorage.setItem(storageKey, payloadWithNonce);
     } catch (err) {
-      // ignore quota errors
+      // ignore quota error
+    }
+
+    // 3. Internet Cloud WebSocket Relay (Crucial for Vercel / Cross-Device links)
+    if (this.wsRelay && this.wsRelay.readyState === WebSocket.OPEN) {
+      try {
+        this.wsRelay.send(JSON.stringify(event));
+      } catch (err) {
+        console.error('Error sending via WebSocket Relay:', err);
+      }
     }
   }
 
@@ -117,12 +181,11 @@ class RealtimeChannelService {
   private notifyListeners(event: RoomEvent): void {
     const eventId = `${event.senderId}_${event.type}_${event.timestamp}_${JSON.stringify(event.payload).length}`;
     if (this.processedEvents.has(eventId)) {
-      return; // Ignore duplicate event received via both BroadcastChannel and storage
+      return; // Ignore duplicate event received over local + cloud channels
     }
     this.processedEvents.add(eventId);
 
-    // Keep deduplication set compact
-    if (this.processedEvents.size > 150) {
+    if (this.processedEvents.size > 200) {
       const firstVal = this.processedEvents.values().next().value;
       if (firstVal) this.processedEvents.delete(firstVal);
     }
@@ -145,6 +208,14 @@ class RealtimeChannelService {
     if (this.storageListener) {
       window.removeEventListener('storage', this.storageListener);
       this.storageListener = null;
+    }
+    if (this.wsRelay) {
+      this.wsRelay.close();
+      this.wsRelay = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
     this.currentRoom = null;
     this.listeners.clear();
