@@ -12,7 +12,8 @@ export type EventType =
   | 'ROOM_SYNC'
   | 'ICE_CANDIDATE'
   | 'OFFER'
-  | 'ANSWER';
+  | 'ANSWER'
+  | 'ROOM_MEMBERS';
 
 export interface RoomEvent {
   type: EventType;
@@ -24,22 +25,39 @@ export interface RoomEvent {
 
 type EventListener = (event: RoomEvent) => void;
 
+interface ParticipantMeta {
+  name: string;
+  role: 'admin' | 'student';
+  id?: string;
+}
+
 class RealtimeChannelService {
   private channel: BroadcastChannel | null = null;
   private currentRoom: string | null = null;
+  private currentSenderId: string | null = null;
+  private currentParticipantInfo: ParticipantMeta | null = null;
   private listeners: Map<EventType | '*', Set<EventListener>> = new Map();
   private storageListener: ((e: StorageEvent) => void) | null = null;
   private processedEvents: Set<string> = new Set();
 
-  // Public WebSocket Relay for Cross-Device / Internet Signaling (Vercel)
-  private wsRelay: WebSocket | null = null;
+  // Internal WebSocket connection to /ws
+  private ws: WebSocket | null = null;
   private heartbeatTimer: number | null = null;
+  private reconnectTimer: number | null = null;
+  private messageQueue: string[] = [];
 
-  public init(roomCode: string): void {
+  public init(roomCode: string, participantInfo?: ParticipantMeta): void {
     const cleanRoom = roomCode.toUpperCase().trim();
+    if (participantInfo) {
+      this.currentParticipantInfo = participantInfo;
+      if (participantInfo.id) {
+        this.currentSenderId = participantInfo.id;
+      }
+    }
+
     if (
       this.currentRoom === cleanRoom &&
-      (this.channel || (this.wsRelay && this.wsRelay.readyState === WebSocket.OPEN))
+      ((this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) || this.channel)
     ) {
       return;
     }
@@ -49,7 +67,7 @@ class RealtimeChannelService {
     this.currentRoom = cleanRoom;
     this.processedEvents.clear();
 
-    // 1. BroadcastChannel (Same Browser Multi-Tab Sync)
+    // 1. BroadcastChannel (Fast Same Browser Multi-Tab Sync)
     try {
       this.channel = new BroadcastChannel(`edumeet_room_${cleanRoom}`);
       this.channel.onmessage = (e: MessageEvent<RoomEvent>) => {
@@ -61,7 +79,7 @@ class RealtimeChannelService {
       console.warn('BroadcastChannel not available:', err);
     }
 
-    // 2. localStorage Storage Event (Same Machine Multi-Window Fallback)
+    // 2. localStorage Storage Event (Same Machine Fallback)
     this.storageListener = (e: StorageEvent) => {
       if (e.key === `edumeet_event_${cleanRoom}` && e.newValue) {
         try {
@@ -76,21 +94,36 @@ class RealtimeChannelService {
     };
     window.addEventListener('storage', this.storageListener);
 
-    // 3. Internet WebSocket Relay (For Vercel / Cross-Device Worldwide Connections)
-    this.connectWebSocketRelay(cleanRoom);
+    // 3. Robust Internal Full-Stack WebSocket Server (/ws)
+    this.connectInternalWebSocket(cleanRoom);
   }
 
-  private connectWebSocketRelay(roomCode: string): void {
+  private connectInternalWebSocket(roomCode: string): void {
     try {
-      // PieSocket Public Relay channel for this specific room code
-      const apiKey = 'VCWS5aCouB5wBxcmhfPpRR9moEJu-nWKfkBXBSLR';
-      const wsUrl = `wss://relay.piesocket.com/v3/edumeet_${roomCode.toLowerCase()}?api_key=${apiKey}&notify_self=0`;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
 
       const ws = new WebSocket(wsUrl);
-      this.wsRelay = ws;
+      this.ws = ws;
 
       ws.onopen = () => {
-        // Send periodic ping to keep cloud WebSocket connection active
+        // Subscribe to this room on the server
+        const subMsg = JSON.stringify({
+          type: 'SUBSCRIBE',
+          roomCode,
+          senderId: this.currentSenderId || 'anonymous',
+          payload: this.currentParticipantInfo || { role: 'student', name: 'Usuario' },
+          timestamp: Date.now()
+        });
+        ws.send(subMsg);
+
+        // Flush any queued outgoing messages
+        while (this.messageQueue.length > 0) {
+          const queued = this.messageQueue.shift();
+          if (queued) ws.send(queued);
+        }
+
+        // Periodic ping to keep alive
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = window.setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
@@ -102,28 +135,42 @@ class RealtimeChannelService {
       ws.onmessage = (msgEvent: MessageEvent) => {
         try {
           const event: RoomEvent = JSON.parse(msgEvent.data);
-          if (event && event.roomCode === this.currentRoom && event.type !== 'PING') {
+          if (event && event.roomCode === this.currentRoom && event.type !== 'PONG') {
             this.notifyListeners(event);
           }
         } catch (err) {
-          // ignore non-JSON or ping frames
+          // ignore non-JSON frames
         }
       };
 
       ws.onerror = (err) => {
-        console.warn('[Realtime] Cloud WebSocket Relay warning:', err);
+        console.warn('[Realtime] WebSocket notice:', err);
       };
 
       ws.onclose = () => {
-        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        if (this.heartbeatTimer) {
+          clearInterval(this.heartbeatTimer);
+          this.heartbeatTimer = null;
+        }
+
+        // Reconnect if still in the same room
+        if (this.currentRoom === roomCode && !this.reconnectTimer) {
+          this.reconnectTimer = window.setTimeout(() => {
+            this.reconnectTimer = null;
+            if (this.currentRoom === roomCode) {
+              this.connectInternalWebSocket(roomCode);
+            }
+          }, 2000);
+        }
       };
     } catch (err) {
-      console.warn('[Realtime] Could not initialize Cloud WebSocket Relay:', err);
+      console.warn('[Realtime] Could not initialize internal WebSocket:', err);
     }
   }
 
   public send(type: EventType, senderId: string, payload: any): void {
     if (!this.currentRoom) return;
+    this.currentSenderId = senderId;
 
     const event: RoomEvent = {
       type,
@@ -132,6 +179,8 @@ class RealtimeChannelService {
       payload,
       timestamp: Date.now()
     };
+
+    const rawString = JSON.stringify(event);
 
     // 1. Local BroadcastChannel
     if (this.channel) {
@@ -154,13 +203,17 @@ class RealtimeChannelService {
       // ignore quota error
     }
 
-    // 3. Internet Cloud WebSocket Relay (Crucial for Vercel / Cross-Device links)
-    if (this.wsRelay && this.wsRelay.readyState === WebSocket.OPEN) {
+    // 3. Full-Stack WebSocket Server
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
-        this.wsRelay.send(JSON.stringify(event));
+        this.ws.send(rawString);
       } catch (err) {
-        console.error('Error sending via WebSocket Relay:', err);
+        console.error('Error sending via WebSocket:', err);
       }
+    } else {
+      // Buffer until open
+      this.messageQueue.push(rawString);
+      if (this.messageQueue.length > 50) this.messageQueue.shift();
     }
   }
 
@@ -179,17 +232,20 @@ class RealtimeChannelService {
   }
 
   private notifyListeners(event: RoomEvent): void {
-    // Build a stable event ID using sender + type + timestamp
-    // Previously used payload length which caused false duplicate detection
-    // (two different events with same-length payloads would be dropped)
-    const payloadStr = JSON.stringify(event.payload);
+    // Ignore self-broadcasts
+    if (this.currentSenderId && event.senderId === this.currentSenderId) {
+      return;
+    }
+
+    // Build a stable event ID using sender + type + timestamp + payload excerpt
+    const payloadStr = JSON.stringify(event.payload || '');
     const eventId = `${event.senderId}_${event.type}_${event.timestamp}_${payloadStr.slice(0, 64)}`;
     if (this.processedEvents.has(eventId)) {
-      return; // Ignore duplicate event received over local + cloud channels
+      return; // Ignore duplicate event
     }
     this.processedEvents.add(eventId);
 
-    if (this.processedEvents.size > 200) {
+    if (this.processedEvents.size > 300) {
       const firstVal = this.processedEvents.values().next().value;
       if (firstVal) this.processedEvents.delete(firstVal);
     }
@@ -213,15 +269,21 @@ class RealtimeChannelService {
       window.removeEventListener('storage', this.storageListener);
       this.storageListener = null;
     }
-    if (this.wsRelay) {
-      this.wsRelay.close();
-      this.wsRelay = null;
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
     }
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.messageQueue = [];
     this.currentRoom = null;
+    this.currentParticipantInfo = null;
     this.listeners.clear();
     this.processedEvents.clear();
   }

@@ -96,19 +96,23 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     }
   }, [isCameraOff, isMuted, mediaStream]);
 
-  const handleLookupRoom = (code: string) => {
+  const handleLookupRoom = async (code: string) => {
     setErrorMsg('');
-    const cls = StorageService.getClassByCode(code);
+    const clean = code.trim().toUpperCase();
+    if (!clean) {
+      setFoundClass(null);
+      return;
+    }
+
+    const cls = await StorageService.fetchClassByCode(clean);
     if (cls) {
       setFoundClass(cls);
-    } else if (code.trim().length > 0) {
-      // Create ad-hoc session if code exists but not stored locally
-      // Use 'direct' access mode so students can join without approval
-      // when no matching class is found in this browser's storage
+    } else {
+      // Create ad-hoc session if code exists but not stored
       const adHoc: ClassSession = {
-        id: 'adhoc-' + code,
-        code: code.trim().toUpperCase(),
-        title: `Sala ${code.toUpperCase()}`,
+        id: 'adhoc-' + clean,
+        code: clean,
+        title: `Sala ${clean}`,
         subject: 'Reunión Virtual',
         date: new Date().toISOString().split('T')[0],
         time: 'Ahora',
@@ -123,67 +127,103 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
 
   const studentIdRef = useRef('usr-' + Math.random().toString(36).substr(2, 6)).current;
 
-  const handleFormSubmit = (e: React.FormEvent) => {
+  const handleProceedToRoom = (session: ClassSession) => {
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      setMediaStream(null);
+    }
+
+    onJoinRoom(session, studentName.trim(), {
+      name: studentName.trim(),
+      isMuted,
+      isCameraOff,
+      participantId: studentIdRef
+    });
+  };
+
+  const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!studentName.trim()) {
       setErrorMsg('Por favor ingresa tu Nombre y Apellido');
       return;
     }
-    if (!foundClass) {
+
+    let targetClass = foundClass;
+    if (!targetClass) {
       if (!roomCode.trim()) {
         setErrorMsg('Ingresa un código de sala válido');
         return;
       }
-      handleLookupRoom(roomCode);
-      return;
+      const fetched = await StorageService.fetchClassByCode(roomCode);
+      if (fetched) {
+        targetClass = fetched;
+        setFoundClass(fetched);
+      } else {
+        targetClass = {
+          id: 'adhoc-' + roomCode.trim().toUpperCase(),
+          code: roomCode.trim().toUpperCase(),
+          title: `Sala ${roomCode.trim().toUpperCase()}`,
+          subject: 'Reunión Virtual',
+          date: new Date().toISOString().split('T')[0],
+          time: 'Ahora',
+          accessMode: 'direct',
+          adminName: 'Docente',
+          createdAt: new Date().toISOString(),
+          status: 'live'
+        };
+        setFoundClass(targetClass);
+      }
     }
 
     StorageService.setUserName(studentName.trim());
 
     // Check access mode
-    if (foundClass.accessMode === 'permission') {
+    if (targetClass.accessMode === 'permission') {
       // Need admin approval
       const tempId = studentIdRef;
       setWaitingParticipantId(tempId);
       setIsWaitingForApproval(true);
 
-      // Subscribe to join response via BroadcastChannel
-      realtimeService.init(foundClass.code);
+      realtimeService.init(targetClass.code, {
+        name: studentName.trim(),
+        role: 'student',
+        id: tempId
+      });
+
       const unsubscribe = realtimeService.subscribe('JOIN_RESPONSE', (event) => {
-        if (event.payload.participantId === tempId) {
+        if (event.payload && event.payload.participantId === tempId) {
           if (event.payload.accepted) {
             unsubscribe();
-            onJoinRoom(foundClass, studentName.trim(), {
-              name: studentName.trim(),
-              isMuted,
-              isCameraOff,
-              participantId: studentIdRef
-            });
+            handleProceedToRoom(targetClass!);
           } else {
             setIsWaitingForApproval(false);
-            setErrorMsg('El administrador ha rechazado la solicitud de ingreso.');
+            setErrorMsg('El docente ha rechazado la solicitud de ingreso a la sala.');
             unsubscribe();
           }
         }
       });
 
-      // Broadcast join request to Admin tab
-      realtimeService.send('JOIN_REQUEST', tempId, {
-        participantId: tempId,
-        name: studentName.trim(),
-        role: 'student',
-        isMuted,
-        isCameraOff
-      });
+      // Send join request immediately and retry once after socket establishes
+      const sendJoin = () => {
+        realtimeService.send('JOIN_REQUEST', tempId, {
+          participantId: tempId,
+          name: studentName.trim(),
+          role: 'student',
+          isMuted,
+          isCameraOff
+        });
+      };
 
+      sendJoin();
+      const retryTimer = setTimeout(sendJoin, 1200);
+
+      return () => {
+        clearTimeout(retryTimer);
+        unsubscribe();
+      };
     } else {
       // Direct access mode
-      onJoinRoom(foundClass, studentName.trim(), {
-        name: studentName.trim(),
-        isMuted,
-        isCameraOff,
-        participantId: studentIdRef
-      });
+      handleProceedToRoom(targetClass);
     }
   };
 

@@ -1,0 +1,11 @@
+{
+  "name": "EduMeet Pro",
+  "description": "Plataforma profesional de videoconferencia en tiempo real para clases virtuales con control de sala, grabación local y transcripción en vivo.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

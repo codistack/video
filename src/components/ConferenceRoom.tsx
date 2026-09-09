@@ -246,6 +246,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
   // WebRTC Peer Connections Ref
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const iceCandidateQueueRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
 
   // Video Element Refs
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -399,7 +400,11 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
   // 3. Real-Time Room Synchronization & WebRTC Event Handlers
   useEffect(() => {
-    realtimeService.init(classSession.code);
+    realtimeService.init(classSession.code, {
+      name: userName,
+      role: userRole,
+      id: userId
+    });
 
     // Register self in participants list
     const myParticipant: Participant = {
@@ -416,14 +421,9 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     setParticipants([myParticipant]);
 
     // Broadcast join and request sync from existing peers
-    // Send immediately via BroadcastChannel (same browser) and WS (cross-device)
     realtimeService.send('PARTICIPANT_UPDATE', userId, myParticipant);
     realtimeService.send('ROOM_SYNC', userId, { requestSync: true });
 
-    // Re-broadcast after short delays to handle WS relay connection timing:
-    // PieSocket WS may still be connecting when we first join, so the first
-    // broadcast may only reach same-browser tabs. Re-sending ensures cross-device
-    // participants (teacher on different machine) will receive our presence.
     const retryTimer1 = window.setTimeout(() => {
       realtimeService.send('PARTICIPANT_UPDATE', userId, {
         id: userId,
@@ -436,7 +436,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         joinedAt: myParticipant.joinedAt
       });
       realtimeService.send('ROOM_SYNC', userId, { requestSync: true });
-    }, 1500);
+    }, 1200);
 
     const retryTimer2 = window.setTimeout(() => {
       realtimeService.send('PARTICIPANT_UPDATE', userId, {
@@ -449,7 +449,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         isScreenSharing: isScreenSharingRef.current,
         joinedAt: myParticipant.joinedAt
       });
-    }, 4000);
+    }, 3000);
 
     const initialSysMessage: ChatMessage = {
       id: 'sys-' + Date.now(),
@@ -468,9 +468,6 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
       switch (event.type) {
         case 'ROOM_SYNC': {
-          // Send current participant info using REFS (avoids stale closure problem)
-          // Without refs, admin would always respond with values from mount-time,
-          // causing the teacher to appear invisible to newly-joining students.
           realtimeService.send('PARTICIPANT_UPDATE', userId, {
             id: userId,
             name: userName,
@@ -480,6 +477,32 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             isCameraOff: isCameraOffRef.current,
             isScreenSharing: isScreenSharingRef.current,
             joinedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          });
+          break;
+        }
+
+        case 'ROOM_MEMBERS': {
+          const members = event.payload?.members || [];
+          members.forEach((m: { id: string; name: string; role: 'admin' | 'student' }) => {
+            if (m.id !== userId) {
+              setParticipants(prev => {
+                if (prev.some(p => p.id === m.id)) return prev;
+                return [...prev, {
+                  id: m.id,
+                  name: m.name,
+                  role: m.role,
+                  status: 'active',
+                  isMuted: false,
+                  isCameraOff: false,
+                  isScreenSharing: false,
+                  joinedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                }];
+              });
+              // Professor initiates WebRTC connection
+              if (userRole === 'admin') {
+                createPeerConnection(m.id, true);
+              }
+            }
           });
           break;
         }
@@ -495,9 +518,16 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             }
           });
 
-          // Initiate WebRTC peer connection with remote participant
+          // Initiate WebRTC peer connection with remote participant without glare
           if (remoteP.id !== userId && !remoteP.isSimulated) {
-            const isOfferer = userId < remoteP.id || userRole === 'admin';
+            let isOfferer = false;
+            if (userRole === 'admin' && remoteP.role === 'student') {
+              isOfferer = true;
+            } else if (userRole === 'student' && remoteP.role === 'admin') {
+              isOfferer = false;
+            } else {
+              isOfferer = userId < remoteP.id;
+            }
             createPeerConnection(remoteP.id, isOfferer);
           }
           break;
@@ -507,7 +537,15 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
           if (event.payload.targetId === userId) {
             const pc = createPeerConnection(event.senderId, false);
             pc.setRemoteDescription(new RTCSessionDescription(event.payload.sdp))
-              .then(() => pc.createAnswer())
+              .then(() => {
+                // Flush queued ICE candidates
+                const queued = iceCandidateQueueRef.current.get(event.senderId) || [];
+                queued.forEach(cand => {
+                  pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn("Queued ICE error:", e));
+                });
+                iceCandidateQueueRef.current.delete(event.senderId);
+                return pc.createAnswer();
+              })
               .then(answer => pc.setLocalDescription(answer))
               .then(() => {
                 realtimeService.send('ANSWER', userId, {
@@ -525,6 +563,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             const pc = peerConnectionsRef.current.get(event.senderId);
             if (pc) {
               pc.setRemoteDescription(new RTCSessionDescription(event.payload.sdp))
+                .then(() => {
+                  // Flush queued ICE candidates
+                  const queued = iceCandidateQueueRef.current.get(event.senderId) || [];
+                  queued.forEach(cand => {
+                    pc.addIceCandidate(new RTCIceCandidate(cand)).catch(e => console.warn("Queued ICE error:", e));
+                  });
+                  iceCandidateQueueRef.current.delete(event.senderId);
+                })
                 .catch(err => console.error("Error setting answer:", err));
             }
           }
@@ -535,8 +581,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
           if (event.payload.targetId === userId) {
             const pc = peerConnectionsRef.current.get(event.senderId);
             if (pc && event.payload.candidate) {
-              pc.addIceCandidate(new RTCIceCandidate(event.payload.candidate))
-                .catch(err => console.error("Error adding ICE candidate:", err));
+              if (pc.remoteDescription && pc.remoteDescription.type) {
+                pc.addIceCandidate(new RTCIceCandidate(event.payload.candidate))
+                  .catch(err => console.error("Error adding ICE candidate:", err));
+              } else {
+                const queue = iceCandidateQueueRef.current.get(event.senderId) || [];
+                queue.push(event.payload.candidate);
+                iceCandidateQueueRef.current.set(event.senderId, queue);
+              }
             }
           }
           break;
@@ -566,7 +618,16 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         case 'FORCE_MUTE': {
           if (event.payload.targetParticipantId === userId) {
             setIsMuted(true);
-            alert('El profesor/administrador ha silenciado tu micrófono.');
+            const sysMuteMsg: ChatMessage = {
+              id: 'mute-' + Date.now(),
+              senderId: 'system',
+              senderName: 'Sistema',
+              role: 'system',
+              text: 'El profesor ha silenciado tu micrófono.',
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              isSystem: true
+            };
+            setChatMessages(prev => [...prev, sysMuteMsg]);
           }
           break;
         }
@@ -574,7 +635,16 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         case 'FORCE_CAMERA_OFF': {
           if (event.payload.targetParticipantId === userId) {
             setIsCameraOff(true);
-            alert('El profesor/administrador ha apagado tu cámara.');
+            const sysCamMsg: ChatMessage = {
+              id: 'cam-' + Date.now(),
+              senderId: 'system',
+              senderName: 'Sistema',
+              role: 'system',
+              text: 'El profesor ha apagado tu cámara.',
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              isSystem: true
+            };
+            setChatMessages(prev => [...prev, sysCamMsg]);
           }
           break;
         }
@@ -601,6 +671,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             pc.close();
             peerConnectionsRef.current.delete(targetId);
           }
+          iceCandidateQueueRef.current.delete(targetId);
           setRemoteStreams(prev => {
             const next = new Map(prev);
             next.delete(targetId);
@@ -621,6 +692,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       unsub();
       peerConnectionsRef.current.forEach(pc => pc.close());
       peerConnectionsRef.current.clear();
+      iceCandidateQueueRef.current.clear();
       realtimeService.send('PARTICIPANT_LEAVE', userId, { id: userId });
       realtimeService.leave();
     };
@@ -814,7 +886,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   };
 
   const copyRoomLink = () => {
-    const link = `${window.location.origin}/?room=${classSession.code}`;
+    const link = `${window.location.origin}/?room=${encodeURIComponent(classSession.code)}&role=student`;
     navigator.clipboard.writeText(link);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);

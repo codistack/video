@@ -95,7 +95,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onStartClass }) => {
   };
 
   const getDirectLink = (code: string) => {
-    return `${window.location.origin}/?room=${code}`;
+    return `${window.location.origin}/?room=${encodeURIComponent(code)}&role=student`;
   };
 
   const copyToClipboard = (code: string, e: React.MouseEvent) => {
