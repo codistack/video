@@ -28,27 +28,44 @@ class RealtimeChannelService {
   private channel: BroadcastChannel | null = null;
   private currentRoom: string | null = null;
   private listeners: Map<EventType | '*', Set<EventListener>> = new Map();
+  private storageListener: ((e: StorageEvent) => void) | null = null;
 
   public init(roomCode: string): void {
     const cleanRoom = roomCode.toUpperCase().trim();
-    if (this.channel && this.currentRoom === cleanRoom) return;
+    if (this.currentRoom === cleanRoom && this.channel) return;
 
-    if (this.channel) {
-      this.channel.close();
-    }
+    this.leave();
 
     this.currentRoom = cleanRoom;
-    this.channel = new BroadcastChannel(`edumeet_room_${cleanRoom}`);
-    
-    this.channel.onmessage = (e: MessageEvent<RoomEvent>) => {
-      if (e.data && e.data.roomCode === this.currentRoom) {
-        this.notifyListeners(e.data);
+    try {
+      this.channel = new BroadcastChannel(`edumeet_room_${cleanRoom}`);
+      this.channel.onmessage = (e: MessageEvent<RoomEvent>) => {
+        if (e.data && e.data.roomCode === this.currentRoom) {
+          this.notifyListeners(e.data);
+        }
+      };
+    } catch (err) {
+      console.warn('BroadcastChannel not available, relying on localStorage events:', err);
+    }
+
+    // Fallback/secondary listener using window storage event
+    this.storageListener = (e: StorageEvent) => {
+      if (e.key === `edumeet_event_${cleanRoom}` && e.newValue) {
+        try {
+          const event: RoomEvent = JSON.parse(e.newValue);
+          if (event && event.roomCode === this.currentRoom) {
+            this.notifyListeners(event);
+          }
+        } catch (err) {
+          // ignore parse errors
+        }
       }
     };
+    window.addEventListener('storage', this.storageListener);
   }
 
   public send(type: EventType, senderId: string, payload: any): void {
-    if (!this.channel || !this.currentRoom) return;
+    if (!this.currentRoom) return;
 
     const event: RoomEvent = {
       type,
@@ -58,11 +75,21 @@ class RealtimeChannelService {
       timestamp: Date.now()
     };
 
+    // 1. Post to BroadcastChannel
+    if (this.channel) {
+      try {
+        this.channel.postMessage(event);
+      } catch (err) {
+        console.error('Error posting BroadcastChannel message:', err);
+      }
+    }
+
+    // 2. Post to localStorage for cross-window / tab fallback
     try {
-      this.channel.postMessage(event);
-      // Trigger locally as well if requested
+      const storageKey = `edumeet_event_${this.currentRoom}`;
+      localStorage.setItem(storageKey, JSON.stringify(event));
     } catch (err) {
-      console.error('Error posting BroadcastChannel message:', err);
+      // ignore quota errors
     }
   }
 
@@ -95,6 +122,10 @@ class RealtimeChannelService {
     if (this.channel) {
       this.channel.close();
       this.channel = null;
+    }
+    if (this.storageListener) {
+      window.removeEventListener('storage', this.storageListener);
+      this.storageListener = null;
     }
     this.currentRoom = null;
     this.listeners.clear();

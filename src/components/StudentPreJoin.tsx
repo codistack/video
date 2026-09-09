@@ -119,6 +119,8 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     }
   };
 
+  const studentIdRef = useRef('usr-' + Math.random().toString(36).substr(2, 6)).current;
+
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!studentName.trim()) {
@@ -139,7 +141,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     // Check access mode
     if (foundClass.accessMode === 'permission') {
       // Need admin approval
-      const tempId = 'student-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4);
+      const tempId = studentIdRef;
       setWaitingParticipantId(tempId);
       setIsWaitingForApproval(true);
 
@@ -152,7 +154,8 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
             onJoinRoom(foundClass, studentName.trim(), {
               name: studentName.trim(),
               isMuted,
-              isCameraOff
+              isCameraOff,
+              participantId: studentIdRef
             });
           } else {
             setIsWaitingForApproval(false);
@@ -176,7 +179,8 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
       onJoinRoom(foundClass, studentName.trim(), {
         name: studentName.trim(),
         isMuted,
-        isCameraOff
+        isCameraOff,
+        participantId: studentIdRef
       });
     }
   };

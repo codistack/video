@@ -48,4 +48,5 @@ export interface PreCallSettings {
   name: string;
   isMuted: boolean;
   isCameraOff: boolean;
+  participantId?: string;
 }

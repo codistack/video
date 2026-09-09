@@ -12,16 +12,10 @@ import {
   Disc, 
   Square, 
   PhoneOff, 
-  Shield, 
-  User, 
-  Share2, 
   Copy, 
   Check, 
-  Volume2, 
   Maximize, 
-  Minimize,
-  Sparkles,
-  Info
+  Minimize
 } from 'lucide-react';
 import { 
   ClassSession, 
@@ -43,6 +37,124 @@ interface ConferenceRoomProps {
   onLeaveRoom: () => void;
 }
 
+// Remote Video Player Helper Component
+const RemoteVideoPlayer: React.FC<{
+  stream: MediaStream;
+  isCameraOff: boolean;
+  name: string;
+}> = ({ stream, isCameraOff, name }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(err => console.warn("Remote video playback note:", err));
+    }
+  }, [stream]);
+
+  if (isCameraOff) {
+    return (
+      <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900/90 text-slate-400 gap-3">
+        <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white text-2xl font-extrabold shadow-lg shadow-indigo-600/20">
+          {name.charAt(0).toUpperCase()}
+        </div>
+        <span className="text-xs text-slate-400 font-medium">Cámara Desactivada</span>
+      </div>
+    );
+  }
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      className="w-full h-full object-cover"
+    />
+  );
+};
+
+// Audio Mixer Helper for MediaRecorder Recording
+const createMixedMediaStream = (
+  videoStream: MediaStream | null,
+  micStream: MediaStream | null,
+  remoteStreamsMap: Map<string, MediaStream>
+): { stream: MediaStream; cleanUp: () => void } => {
+  const compositeStream = new MediaStream();
+  const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+  let audioCtx: AudioContext | null = null;
+  const sources: MediaStreamAudioSourceNode[] = [];
+
+  // 1. Video Track: Screen share takes priority if available, otherwise local camera
+  const videoTrack = videoStream?.getVideoTracks()[0] || micStream?.getVideoTracks()[0];
+  if (videoTrack) {
+    compositeStream.addTrack(videoTrack);
+  }
+
+  // 2. Mix Audio Tracks using Web Audio API
+  if (AudioCtx) {
+    try {
+      audioCtx = new AudioCtx();
+      const destination = audioCtx.createMediaStreamDestination();
+
+      // Add local microphone audio
+      if (micStream && micStream.getAudioTracks().length > 0) {
+        try {
+          const micSource = audioCtx.createMediaStreamSource(micStream);
+          micSource.connect(destination);
+          sources.push(micSource);
+        } catch (e) {
+          console.warn("Mic audio mix error:", e);
+        }
+      }
+
+      // Add screen share audio if present
+      if (videoStream && videoStream !== micStream && videoStream.getAudioTracks().length > 0) {
+        try {
+          const screenAudioSource = audioCtx.createMediaStreamSource(videoStream);
+          screenAudioSource.connect(destination);
+          sources.push(screenAudioSource);
+        } catch (e) {
+          console.warn("Screen audio mix error:", e);
+        }
+      }
+
+      // Add remote student/peer audio tracks
+      remoteStreamsMap.forEach((rStream) => {
+        if (rStream && rStream.getAudioTracks().length > 0) {
+          try {
+            const rSource = audioCtx.createMediaStreamSource(rStream);
+            rSource.connect(destination);
+            sources.push(rSource);
+          } catch (e) {
+            console.warn("Remote audio mix error:", e);
+          }
+        }
+      });
+
+      const mixedAudioTrack = destination.stream.getAudioTracks()[0];
+      if (mixedAudioTrack) {
+        compositeStream.addTrack(mixedAudioTrack);
+      }
+    } catch (err) {
+      console.warn("AudioContext initialization warning:", err);
+    }
+  }
+
+  // Fallback: If AudioContext audio mixing failed, attach mic audio track directly
+  if (compositeStream.getAudioTracks().length === 0 && micStream?.getAudioTracks()[0]) {
+    compositeStream.addTrack(micStream.getAudioTracks()[0]);
+  }
+
+  const cleanUp = () => {
+    sources.forEach(s => { try { s.disconnect(); } catch (e) {} });
+    if (audioCtx && audioCtx.state !== 'closed') {
+      try { audioCtx.close(); } catch (e) {}
+    }
+  };
+
+  return { stream: compositeStream, cleanUp };
+};
+
 export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   classSession,
   userRole,
@@ -51,7 +163,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   onLeaveRoom
 }) => {
   // Local User State
-  const userId = useRef('usr-' + Math.random().toString(36).substr(2, 6)).current;
+  const userId = useRef(preCallSettings.participantId || 'usr-' + Math.random().toString(36).substr(2, 6)).current;
   const [isMuted, setIsMuted] = useState(preCallSettings.isMuted);
   const [isCameraOff, setIsCameraOff] = useState(preCallSettings.isCameraOff);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -68,18 +180,23 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<number | null>(null);
+  const recordCleanupRef = useRef<(() => void) | null>(null);
 
   // Data Lists
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [pendingRequests, setPendingRequests] = useState<Participant[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [transcriptions, setTranscriptions] = useState<TranscriptionItem[]>([]);
+  const [, setTranscriptions] = useState<TranscriptionItem[]>([]);
 
-  // Local Media Streams
+  // Local & Remote Media Streams
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
 
-  // Video Refs
+  // WebRTC Peer Connections Ref
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+
+  // Video Element Refs
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -90,7 +207,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
   // 1. Initialize Local Media Stream
   useEffect(() => {
-    let streamTrack: MediaStream | null = null;
+    let activeStream: MediaStream | null = null;
 
     const initMedia = async () => {
       try {
@@ -98,16 +215,12 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
           audio: true
         });
-        streamTrack = stream;
+        activeStream = stream;
         setLocalStream(stream);
 
         // Apply initial mute/camera state
         stream.getAudioTracks().forEach(t => t.enabled = !preCallSettings.isMuted);
         stream.getVideoTracks().forEach(t => t.enabled = !preCallSettings.isCameraOff);
-
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
       } catch (err) {
         console.warn('Could not acquire local camera/mic stream:', err);
       }
@@ -116,20 +229,112 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     initMedia();
 
     return () => {
-      if (streamTrack) {
-        streamTrack.getTracks().forEach(track => track.stop());
+      if (activeStream) {
+        activeStream.getTracks().forEach(track => track.stop());
       }
     };
   }, []);
 
-  // Update track enabled status when state changes
+  // Update video element when local stream changes
+  useEffect(() => {
+    if (localVideoRef.current && localStream) {
+      localVideoRef.current.srcObject = localStream;
+    }
+  }, [localStream, isCameraOff, isScreenSharing]);
+
+  // Update video element when screen stream changes
+  useEffect(() => {
+    if (screenVideoRef.current && screenStream) {
+      screenVideoRef.current.srcObject = screenStream;
+      screenVideoRef.current.play().catch(err => console.warn("Screen video play error:", err));
+    }
+  }, [screenStream, isScreenSharing]);
+
+  // 2. WebRTC Peer Connection Helper
+  const createPeerConnection = (targetId: string, isOfferer: boolean): RTCPeerConnection => {
+    if (peerConnectionsRef.current.has(targetId)) {
+      return peerConnectionsRef.current.get(targetId)!;
+    }
+
+    const rtcConfig: RTCConfiguration = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ]
+    };
+
+    const pc = new RTCPeerConnection(rtcConfig);
+    peerConnectionsRef.current.set(targetId, pc);
+
+    // Add local tracks to WebRTC peer connection
+    const activeStream = (isScreenSharing && screenStream) ? screenStream : localStream;
+    if (activeStream) {
+      activeStream.getTracks().forEach(track => {
+        pc.addTrack(track, activeStream);
+      });
+    }
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        realtimeService.send('ICE_CANDIDATE', userId, {
+          targetId,
+          candidate: event.candidate
+        });
+      }
+    };
+
+    pc.ontrack = (event) => {
+      if (event.streams && event.streams[0]) {
+        const rStream = event.streams[0];
+        setRemoteStreams(prev => {
+          const next = new Map(prev);
+          next.set(targetId, rStream);
+          return next;
+        });
+      }
+    };
+
+    if (isOfferer) {
+      pc.createOffer()
+        .then(offer => pc.setLocalDescription(offer))
+        .then(() => {
+          realtimeService.send('OFFER', userId, {
+            targetId,
+            sdp: pc.localDescription
+          });
+        })
+        .catch(err => console.error("Error creating WebRTC offer:", err));
+    }
+
+    return pc;
+  };
+
+  // Update track enabled status & WebRTC Senders when state changes
   useEffect(() => {
     if (localStream) {
       localStream.getAudioTracks().forEach(t => t.enabled = !isMuted);
       localStream.getVideoTracks().forEach(t => t.enabled = !isCameraOff);
     }
 
-    // Broadcast update to other tabs
+    // Update WebRTC track senders across all active peer connections
+    peerConnectionsRef.current.forEach((pc) => {
+      const senders = pc.getSenders();
+      const videoSender = senders.find(s => s.track?.kind === 'video');
+      const audioSender = senders.find(s => s.track?.kind === 'audio');
+
+      const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
+      const activeVideoTrack = activeVideoStream?.getVideoTracks()[0] || null;
+      const activeAudioTrack = localStream?.getAudioTracks()[0] || null;
+
+      if (videoSender && activeVideoTrack) {
+        videoSender.replaceTrack(activeVideoTrack).catch(e => console.warn("Replace video track error:", e));
+      }
+      if (audioSender && activeAudioTrack) {
+        audioSender.replaceTrack(activeAudioTrack).catch(e => console.warn("Replace audio track error:", e));
+      }
+    });
+
+    // Broadcast participant update
     realtimeService.send('PARTICIPANT_UPDATE', userId, {
       id: userId,
       name: userName,
@@ -138,9 +343,9 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       isCameraOff,
       isScreenSharing
     });
-  }, [isMuted, isCameraOff, isScreenSharing, localStream, userId, userName, userRole]);
+  }, [isMuted, isCameraOff, isScreenSharing, localStream, screenStream, userId, userName, userRole]);
 
-  // 2. Initialize Real-Time Room Synchronization (BroadcastChannel)
+  // 3. Real-Time Room Synchronization & WebRTC Event Handlers
   useEffect(() => {
     realtimeService.init(classSession.code);
 
@@ -158,8 +363,9 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
     setParticipants([myParticipant]);
 
-    // Send initial join notification & system chat
+    // Broadcast join and request sync from existing peers
     realtimeService.send('PARTICIPANT_UPDATE', userId, myParticipant);
+    realtimeService.send('ROOM_SYNC', userId, { requestSync: true });
 
     const initialSysMessage: ChatMessage = {
       id: 'sys-' + Date.now(),
@@ -174,9 +380,24 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
     // Subscribe to incoming events
     const unsub = realtimeService.subscribe('*', (event) => {
-      if (event.senderId === userId) return; // Ignore self
+      if (event.senderId === userId) return; // Ignore self events
 
       switch (event.type) {
+        case 'ROOM_SYNC': {
+          // Send our current participant info so the newly joined peer receives it
+          realtimeService.send('PARTICIPANT_UPDATE', userId, {
+            id: userId,
+            name: userName,
+            role: userRole,
+            status: 'active',
+            isMuted,
+            isCameraOff,
+            isScreenSharing,
+            joinedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          });
+          break;
+        }
+
         case 'PARTICIPANT_UPDATE': {
           const remoteP: Participant = event.payload;
           setParticipants(prev => {
@@ -187,6 +408,51 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
               return [...prev, { ...remoteP, status: 'active' }];
             }
           });
+
+          // Initiate WebRTC peer connection with remote participant
+          if (remoteP.id !== userId && !remoteP.isSimulated) {
+            const isOfferer = userId < remoteP.id || userRole === 'admin';
+            createPeerConnection(remoteP.id, isOfferer);
+          }
+          break;
+        }
+
+        case 'OFFER': {
+          if (event.payload.targetId === userId) {
+            const pc = createPeerConnection(event.senderId, false);
+            pc.setRemoteDescription(new RTCSessionDescription(event.payload.sdp))
+              .then(() => pc.createAnswer())
+              .then(answer => pc.setLocalDescription(answer))
+              .then(() => {
+                realtimeService.send('ANSWER', userId, {
+                  targetId: event.senderId,
+                  sdp: pc.localDescription
+                });
+              })
+              .catch(err => console.error("Error handling offer:", err));
+          }
+          break;
+        }
+
+        case 'ANSWER': {
+          if (event.payload.targetId === userId) {
+            const pc = peerConnectionsRef.current.get(event.senderId);
+            if (pc) {
+              pc.setRemoteDescription(new RTCSessionDescription(event.payload.sdp))
+                .catch(err => console.error("Error setting answer:", err));
+            }
+          }
+          break;
+        }
+
+        case 'ICE_CANDIDATE': {
+          if (event.payload.targetId === userId) {
+            const pc = peerConnectionsRef.current.get(event.senderId);
+            if (pc && event.payload.candidate) {
+              pc.addIceCandidate(new RTCIceCandidate(event.payload.candidate))
+                .catch(err => console.error("Error adding ICE candidate:", err));
+            }
+          }
           break;
         }
 
@@ -206,7 +472,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
               if (prev.some(p => p.id === pendingStudent.id)) return prev;
               return [...prev, pendingStudent];
             });
-            setShowParticipants(true); // Open panel for admin to see pending request
+            setShowParticipants(true); // Open panel for admin to accept
           }
           break;
         }
@@ -243,7 +509,18 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         }
 
         case 'PARTICIPANT_LEAVE': {
-          setParticipants(prev => prev.filter(p => p.id !== event.senderId));
+          const targetId = event.senderId;
+          const pc = peerConnectionsRef.current.get(targetId);
+          if (pc) {
+            pc.close();
+            peerConnectionsRef.current.delete(targetId);
+          }
+          setRemoteStreams(prev => {
+            const next = new Map(prev);
+            next.delete(targetId);
+            return next;
+          });
+          setParticipants(prev => prev.filter(p => p.id !== targetId));
           break;
         }
 
@@ -254,12 +531,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
     return () => {
       unsub();
+      peerConnectionsRef.current.forEach(pc => pc.close());
+      peerConnectionsRef.current.clear();
       realtimeService.send('PARTICIPANT_LEAVE', userId, { id: userId });
       realtimeService.leave();
     };
   }, [classSession.code, userId, userName, userRole]);
 
-  // 3. Screen Sharing Handler
+  // 4. Screen Sharing Handler
   const toggleScreenShare = async () => {
     if (isScreenSharing) {
       if (screenStream) {
@@ -276,11 +555,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         setScreenStream(stream);
         setIsScreenSharing(true);
 
-        if (screenVideoRef.current) {
-          screenVideoRef.current.srcObject = stream;
-        }
-
-        // When user stops screen share via native browser bar
+        // Native browser stop button handler
         stream.getVideoTracks()[0].onended = () => {
           setIsScreenSharing(false);
           setScreenStream(null);
@@ -291,22 +566,30 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     }
   };
 
-  // 4. Local Class Recording (MediaRecorder API)
+  // 5. Local Class Recording with Mixed Audio (Mic + Screen + Remote Peers)
   const startRecording = () => {
     try {
       recordedChunksRef.current = [];
-      const streamToRecord = screenStream || localStream;
+      const videoStreamToRecord = screenStream || localStream;
 
-      if (!streamToRecord) {
+      if (!videoStreamToRecord && remoteStreams.size === 0) {
         alert('No hay flujo de video activo para grabar.');
         return;
       }
+
+      // Mix video and audio tracks
+      const { stream: compositeStream, cleanUp } = createMixedMediaStream(
+        videoStreamToRecord,
+        localStream,
+        remoteStreams
+      );
+      recordCleanupRef.current = cleanUp;
 
       const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
         ? 'video/webm;codecs=vp9,opus'
         : 'video/webm';
 
-      const mediaRecorder = new MediaRecorder(streamToRecord, { mimeType });
+      const mediaRecorder = new MediaRecorder(compositeStream, { mimeType });
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
@@ -315,6 +598,11 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       };
 
       mediaRecorder.onstop = () => {
+        if (recordCleanupRef.current) {
+          recordCleanupRef.current();
+          recordCleanupRef.current = null;
+        }
+
         const blob = new Blob(recordedChunksRef.current, { type: mimeType });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -341,7 +629,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
     } catch (err) {
       console.error('Error starting MediaRecorder:', err);
-      alert('Error al iniciar la grabación local.');
+      alert('Error al iniciar la grabación local con audio.');
     }
   };
 
@@ -361,7 +649,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  // 5. Admin Remote Participant Control Functions
+  // 6. Admin Remote Control Handlers
   const handleRemoteMuteParticipant = (targetId: string) => {
     if (userRole !== 'admin') return;
     realtimeService.send('FORCE_MUTE', userId, { targetParticipantId: targetId });
@@ -379,7 +667,12 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     if (student) {
       realtimeService.send('JOIN_RESPONSE', userId, { participantId: studentId, accepted: true });
       setPendingRequests(prev => prev.filter(p => p.id !== studentId));
-      setParticipants(prev => [...prev, { ...student, status: 'active' }]);
+      setParticipants(prev => {
+        if (prev.some(p => p.id === studentId)) return prev;
+        return [...prev, { ...student, status: 'active' }];
+      });
+      // Initiate WebRTC peer connection to approved student
+      createPeerConnection(studentId, true);
     }
   };
 
@@ -388,7 +681,6 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     setPendingRequests(prev => prev.filter(p => p.id !== studentId));
   };
 
-  // Add Simulated Virtual Participant for 1-Click Testing
   const handleAddSimulatedParticipant = () => {
     const simNames = ['Camila Silva', 'Mateo Ramírez', 'Sofía López', 'Lucas Fernández', 'Valentina Gómez'];
     const randomName = simNames[Math.floor(Math.random() * simNames.length)] + ' (Simulado)';
@@ -408,7 +700,6 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
     setParticipants(prev => [...prev, simP]);
 
-    // Send system message
     const sysMsg: ChatMessage = {
       id: 'sys-' + Date.now(),
       senderId: 'system',
@@ -421,7 +712,6 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
     setChatMessages(prev => [...prev, sysMsg]);
   };
 
-  // Chat message sending
   const handleSendChatMessage = (text: string) => {
     const newMsg: ChatMessage = {
       id: 'chat-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4),
@@ -469,7 +759,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
             <button
               onClick={copyRoomLink}
-              className="ml-2 p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 text-xs transition"
+              className="ml-2 p-1.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 text-xs transition cursor-pointer"
               title="Copiar enlace de invitación"
             >
               {copiedCode ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
@@ -496,6 +786,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
                   ref={screenVideoRef}
                   autoPlay
                   playsInline
+                  muted
                   className="w-full h-full object-contain bg-black"
                 />
                 <div className="absolute top-4 left-4 bg-indigo-600 text-white text-xs font-bold px-3 py-1 rounded-full shadow">
@@ -505,26 +796,31 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
               {/* Side Participant List */}
               <div className="w-full lg:w-72 flex flex-row lg:flex-col gap-3 overflow-x-auto lg:overflow-y-auto max-h-48 lg:max-h-full">
-                {participants.map(p => (
-                  <div key={p.id} className="relative aspect-video rounded-2xl overflow-hidden bg-slate-900 border border-slate-800 shrink-0">
-                    {p.id === userId && !isCameraOff && localStream ? (
-                      <video
-                        ref={localVideoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className="w-full h-full object-cover transform -scale-x-100"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center bg-slate-900 text-white font-bold text-lg">
-                        {p.name.charAt(0)}
+                {participants.map(p => {
+                  const rStream = remoteStreams.get(p.id);
+                  return (
+                    <div key={p.id} className="relative aspect-video rounded-2xl overflow-hidden bg-slate-900 border border-slate-800 shrink-0">
+                      {p.id === userId && !isCameraOff && localStream ? (
+                        <video
+                          ref={localVideoRef}
+                          autoPlay
+                          playsInline
+                          muted
+                          className="w-full h-full object-cover transform -scale-x-100"
+                        />
+                      ) : rStream ? (
+                        <RemoteVideoPlayer stream={rStream} isCameraOff={p.isCameraOff} name={p.name} />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center bg-slate-900 text-white font-bold text-lg">
+                          {p.name.charAt(0)}
+                        </div>
+                      )}
+                      <div className="absolute bottom-2 left-2 bg-slate-950/80 px-2 py-0.5 rounded text-[10px] text-white">
+                        {p.name}
                       </div>
-                    )}
-                    <div className="absolute bottom-2 left-2 bg-slate-950/80 px-2 py-0.5 rounded text-[10px] text-white">
-                      {p.name}
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           ) : (
@@ -542,13 +838,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             >
               {participants.map((p) => {
                 const isMe = p.id === userId;
+                const rStream = remoteStreams.get(p.id);
 
                 return (
                   <div
                     key={p.id}
                     className="relative aspect-video rounded-3xl overflow-hidden bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800/80 shadow-2xl group flex flex-col items-center justify-center"
                   >
-                    {/* Video Stream for Local User */}
+                    {/* Local User Stream */}
                     {isMe && !isCameraOff && localStream ? (
                       <video
                         ref={localVideoRef}
@@ -557,7 +854,11 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
                         muted
                         className="w-full h-full object-cover transform -scale-x-100"
                       />
+                    ) : !isMe && rStream ? (
+                      /* Remote Connected Student WebRTC Stream */
+                      <RemoteVideoPlayer stream={rStream} isCameraOff={p.isCameraOff} name={p.name} />
                     ) : !p.isCameraOff && p.isSimulated ? (
+                      /* Simulated HD Camera */
                       <div className="relative w-full h-full flex items-center justify-center bg-gradient-to-tr from-indigo-950 to-purple-950">
                         <div className="text-center space-y-2">
                           <div className="w-20 h-20 rounded-full bg-indigo-600/30 border border-indigo-500/40 flex items-center justify-center text-indigo-300 text-2xl font-bold mx-auto animate-pulse">
@@ -639,7 +940,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
                   ? 'bg-rose-600 border-rose-500 text-white shadow-lg shadow-rose-600/30 animate-pulse'
                   : 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
               }`}
-              title={isRecording ? 'Detener Grabación y Descargar' : 'Grabar Clase Localmente'}
+              title={isRecording ? 'Detener Grabación y Descargar' : 'Grabar Clase Localmente con Audio'}
             >
               {isRecording ? <Square className="w-4 h-4 text-white" /> : <Disc className="w-4 h-4 text-rose-400" />}
               <span className="hidden sm:inline">{isRecording ? 'Detener Grabación' : 'Grabar Clase'}</span>
