@@ -29,6 +29,7 @@ class RealtimeChannelService {
   private currentRoom: string | null = null;
   private listeners: Map<EventType | '*', Set<EventListener>> = new Map();
   private storageListener: ((e: StorageEvent) => void) | null = null;
+  private processedEvents: Set<string> = new Set();
 
   public init(roomCode: string): void {
     const cleanRoom = roomCode.toUpperCase().trim();
@@ -37,6 +38,8 @@ class RealtimeChannelService {
     this.leave();
 
     this.currentRoom = cleanRoom;
+    this.processedEvents.clear();
+
     try {
       this.channel = new BroadcastChannel(`edumeet_room_${cleanRoom}`);
       this.channel.onmessage = (e: MessageEvent<RoomEvent>) => {
@@ -84,10 +87,14 @@ class RealtimeChannelService {
       }
     }
 
-    // 2. Post to localStorage for cross-window / tab fallback
+    // 2. Post to localStorage for cross-window / tab fallback with unique nonce
     try {
       const storageKey = `edumeet_event_${this.currentRoom}`;
-      localStorage.setItem(storageKey, JSON.stringify(event));
+      const payloadWithNonce = JSON.stringify({
+        ...event,
+        _nonce: Math.random().toString(36).substring(2) + '_' + Date.now()
+      });
+      localStorage.setItem(storageKey, payloadWithNonce);
     } catch (err) {
       // ignore quota errors
     }
@@ -108,6 +115,18 @@ class RealtimeChannelService {
   }
 
   private notifyListeners(event: RoomEvent): void {
+    const eventId = `${event.senderId}_${event.type}_${event.timestamp}_${JSON.stringify(event.payload).length}`;
+    if (this.processedEvents.has(eventId)) {
+      return; // Ignore duplicate event received via both BroadcastChannel and storage
+    }
+    this.processedEvents.add(eventId);
+
+    // Keep deduplication set compact
+    if (this.processedEvents.size > 150) {
+      const firstVal = this.processedEvents.values().next().value;
+      if (firstVal) this.processedEvents.delete(firstVal);
+    }
+
     const specific = this.listeners.get(event.type);
     if (specific) {
       specific.forEach(fn => fn(event));
@@ -129,6 +148,7 @@ class RealtimeChannelService {
     }
     this.currentRoom = null;
     this.listeners.clear();
+    this.processedEvents.clear();
   }
 }
 

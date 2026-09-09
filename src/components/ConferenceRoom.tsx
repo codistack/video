@@ -73,6 +73,45 @@ const RemoteVideoPlayer: React.FC<{
   );
 };
 
+// Helper to safely add/replace tracks on RTCPeerConnection
+const syncPeerConnectionTracks = (
+  pc: RTCPeerConnection,
+  vStream: MediaStream | null,
+  mStream: MediaStream | null
+) => {
+  const activeVideoTrack = vStream?.getVideoTracks()[0] || mStream?.getVideoTracks()[0] || null;
+  const activeAudioTrack = mStream?.getAudioTracks()[0] || null;
+
+  const senders = pc.getSenders();
+
+  if (activeVideoTrack) {
+    const videoSender = senders.find(s => s.track?.kind === 'video');
+    if (videoSender) {
+      videoSender.replaceTrack(activeVideoTrack).catch(e => console.warn("replaceTrack video error:", e));
+    } else {
+      try {
+        const streamToUse = vStream || mStream;
+        if (streamToUse) pc.addTrack(activeVideoTrack, streamToUse);
+      } catch (e) {
+        console.warn("addTrack video error:", e);
+      }
+    }
+  }
+
+  if (activeAudioTrack) {
+    const audioSender = senders.find(s => s.track?.kind === 'audio');
+    if (audioSender) {
+      audioSender.replaceTrack(activeAudioTrack).catch(e => console.warn("replaceTrack audio error:", e));
+    } else {
+      try {
+        if (mStream) pc.addTrack(activeAudioTrack, mStream);
+      } catch (e) {
+        console.warn("addTrack audio error:", e);
+      }
+    }
+  }
+};
+
 // Audio Mixer Helper for MediaRecorder Recording
 const createMixedMediaStream = (
   videoStream: MediaStream | null,
@@ -252,27 +291,31 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
 
   // 2. WebRTC Peer Connection Helper
   const createPeerConnection = (targetId: string, isOfferer: boolean): RTCPeerConnection => {
-    if (peerConnectionsRef.current.has(targetId)) {
-      return peerConnectionsRef.current.get(targetId)!;
+    const existing = peerConnectionsRef.current.get(targetId);
+    if (existing) {
+      if (existing.connectionState !== 'failed' && existing.connectionState !== 'closed') {
+        const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
+        syncPeerConnectionTracks(existing, activeVideoStream, localStream);
+        return existing;
+      }
+      existing.close();
+      peerConnectionsRef.current.delete(targetId);
     }
 
     const rtcConfig: RTCConfiguration = {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' }
       ]
     };
 
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnectionsRef.current.set(targetId, pc);
 
-    // Add local tracks to WebRTC peer connection
-    const activeStream = (isScreenSharing && screenStream) ? screenStream : localStream;
-    if (activeStream) {
-      activeStream.getTracks().forEach(track => {
-        pc.addTrack(track, activeStream);
-      });
-    }
+    // Add / sync local tracks
+    const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
+    syncPeerConnectionTracks(pc, activeVideoStream, localStream);
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -316,22 +359,9 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       localStream.getVideoTracks().forEach(t => t.enabled = !isCameraOff);
     }
 
-    // Update WebRTC track senders across all active peer connections
     peerConnectionsRef.current.forEach((pc) => {
-      const senders = pc.getSenders();
-      const videoSender = senders.find(s => s.track?.kind === 'video');
-      const audioSender = senders.find(s => s.track?.kind === 'audio');
-
       const activeVideoStream = (isScreenSharing && screenStream) ? screenStream : localStream;
-      const activeVideoTrack = activeVideoStream?.getVideoTracks()[0] || null;
-      const activeAudioTrack = localStream?.getAudioTracks()[0] || null;
-
-      if (videoSender && activeVideoTrack) {
-        videoSender.replaceTrack(activeVideoTrack).catch(e => console.warn("Replace video track error:", e));
-      }
-      if (audioSender && activeAudioTrack) {
-        audioSender.replaceTrack(activeAudioTrack).catch(e => console.warn("Replace audio track error:", e));
-      }
+      syncPeerConnectionTracks(pc, activeVideoStream, localStream);
     });
 
     // Broadcast participant update
@@ -671,8 +701,8 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         if (prev.some(p => p.id === studentId)) return prev;
         return [...prev, { ...student, status: 'active' }];
       });
-      // Initiate WebRTC peer connection to approved student
-      createPeerConnection(studentId, true);
+      // Note: Student will receive JOIN_RESPONSE, mount ConferenceRoom, and broadcast PARTICIPANT_UPDATE,
+      // which triggers createPeerConnection automatically with student's active stream.
     }
   };
 
