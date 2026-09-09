@@ -94,13 +94,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onStartClass }) => {
     loadClasses();
   };
 
-  const getDirectLink = (code: string) => {
-    return `${window.location.origin}/?room=${encodeURIComponent(code)}&role=student`;
+  const getDirectLink = (clsOrCode: ClassSession | string) => {
+    if (typeof clsOrCode === 'object') {
+      return `${window.location.origin}/?room=${encodeURIComponent(clsOrCode.code)}&role=student&title=${encodeURIComponent(clsOrCode.title)}&admin=${encodeURIComponent(clsOrCode.adminName)}&mode=${clsOrCode.accessMode}&subject=${encodeURIComponent(clsOrCode.subject)}`;
+    }
+    const found = classes.find(c => c.code === clsOrCode);
+    if (found) {
+      return `${window.location.origin}/?room=${encodeURIComponent(found.code)}&role=student&title=${encodeURIComponent(found.title)}&admin=${encodeURIComponent(found.adminName)}&mode=${found.accessMode}&subject=${encodeURIComponent(found.subject)}`;
+    }
+    return `${window.location.origin}/?room=${encodeURIComponent(clsOrCode)}&role=student`;
   };
 
-  const copyToClipboard = (code: string, e: React.MouseEvent) => {
+  const copyToClipboard = (sessionOrCode: ClassSession | string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const link = getDirectLink(code);
+    const code = typeof sessionOrCode === 'string' ? sessionOrCode : sessionOrCode.code;
+    const link = getDirectLink(sessionOrCode);
     navigator.clipboard.writeText(link);
     setCopiedCode(code);
     setTimeout(() => setCopiedCode(null), 2500);
@@ -108,7 +116,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ onStartClass }) => {
 
   const shareViaWhatsApp = (session: ClassSession, e: React.MouseEvent) => {
     e.stopPropagation();
-    const link = getDirectLink(session.code);
+    const link = getDirectLink(session);
     const text = `🎓 *Invitación a Clase Virtual - EduMeet Pro*\n\n📌 *Tema:* ${session.title}\n📚 *Materia:* ${session.subject}\n📅 *Fecha:* ${session.date} a las ${session.time}\n🔑 *Código de Clase:* ${session.code}\n\n👉 *Unirse con un clic:* ${link}`;
     const url = `https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`;
     window.open(url, '_blank');

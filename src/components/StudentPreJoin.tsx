@@ -51,6 +51,17 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
     if (initialRoomCode) {
       handleLookupRoom(initialRoomCode);
     }
+
+    // Listen for live class details broadcasted by the teacher
+    const unsubClassInfo = realtimeService.subscribe('CLASS_INFO_RESPONSE', (event) => {
+      if (event.payload && event.payload.classSession) {
+        const liveSession: ClassSession = event.payload.classSession;
+        setFoundClass(liveSession);
+        StorageService.addClass(liveSession);
+      }
+    });
+
+    return () => unsubClassInfo();
   }, [initialRoomCode]);
 
   // Handle local camera preview
@@ -104,9 +115,30 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
       return;
     }
 
+    const params = new URLSearchParams(window.location.search);
+    const titleParam = params.get('title');
+    const adminParam = params.get('admin');
+    const modeParam = params.get('mode') as AccessMode | null;
+    const subjectParam = params.get('subject');
+
     const cls = await StorageService.fetchClassByCode(clean);
     if (cls) {
       setFoundClass(cls);
+    } else if (titleParam || adminParam || modeParam) {
+      const urlClass: ClassSession = {
+        id: 'url-' + clean,
+        code: clean,
+        title: titleParam || `Clase ${clean}`,
+        subject: subjectParam || 'Reunión Virtual',
+        date: new Date().toISOString().split('T')[0],
+        time: 'Ahora',
+        accessMode: modeParam || 'permission',
+        adminName: adminParam || 'Docente',
+        createdAt: new Date().toISOString(),
+        status: 'live'
+      };
+      StorageService.addClass(urlClass);
+      setFoundClass(urlClass);
     } else {
       // Create ad-hoc session if code exists but not stored
       const adHoc: ClassSession = {
@@ -116,13 +148,21 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
         subject: 'Reunión Virtual',
         date: new Date().toISOString().split('T')[0],
         time: 'Ahora',
-        accessMode: 'direct',
+        accessMode: 'permission',
         adminName: 'Docente',
         createdAt: new Date().toISOString(),
         status: 'live'
       };
       setFoundClass(adHoc);
     }
+
+    // Connect to room channel and query teacher for live class session details
+    realtimeService.init(clean, {
+      name: 'Estudiante',
+      role: 'student',
+      id: studentIdRef
+    });
+    realtimeService.send('CLASS_INFO_REQUEST', studentIdRef, { code: clean });
   };
 
   const studentIdRef = useRef('usr-' + Math.random().toString(36).substr(2, 6)).current;
@@ -190,20 +230,7 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
         id: tempId
       });
 
-      const unsubscribe = realtimeService.subscribe('JOIN_RESPONSE', (event) => {
-        if (event.payload && event.payload.participantId === tempId) {
-          if (event.payload.accepted) {
-            unsubscribe();
-            handleProceedToRoom(targetClass!);
-          } else {
-            setIsWaitingForApproval(false);
-            setErrorMsg('El docente ha rechazado la solicitud de ingreso a la sala.');
-            unsubscribe();
-          }
-        }
-      });
-
-      // Send join request immediately and retry once after socket establishes
+      // Send join request immediately and repeat every 2.5 seconds until answered
       const sendJoin = () => {
         realtimeService.send('JOIN_REQUEST', tempId, {
           participantId: tempId,
@@ -215,10 +242,24 @@ export const StudentPreJoin: React.FC<StudentPreJoinProps> = ({
       };
 
       sendJoin();
-      const retryTimer = setTimeout(sendJoin, 1200);
+      const retryInterval = window.setInterval(sendJoin, 2500);
+
+      const unsubscribe = realtimeService.subscribe('JOIN_RESPONSE', (event) => {
+        if (event.payload && event.payload.participantId === tempId) {
+          window.clearInterval(retryInterval);
+          if (event.payload.accepted) {
+            unsubscribe();
+            handleProceedToRoom(targetClass!);
+          } else {
+            setIsWaitingForApproval(false);
+            setErrorMsg('El docente ha rechazado la solicitud de ingreso a la sala.');
+            unsubscribe();
+          }
+        }
+      });
 
       return () => {
-        clearTimeout(retryTimer);
+        window.clearInterval(retryInterval);
         unsubscribe();
       };
     } else {

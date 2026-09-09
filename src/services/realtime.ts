@@ -1,3 +1,4 @@
+import mqtt, { MqttClient } from 'mqtt';
 import { ChatMessage, Participant, TranscriptionItem } from '../types/conference';
 
 export type EventType =
@@ -13,7 +14,9 @@ export type EventType =
   | 'ICE_CANDIDATE'
   | 'OFFER'
   | 'ANSWER'
-  | 'ROOM_MEMBERS';
+  | 'ROOM_MEMBERS'
+  | 'CLASS_INFO_REQUEST'
+  | 'CLASS_INFO_RESPONSE';
 
 export interface RoomEvent {
   type: EventType;
@@ -46,6 +49,10 @@ class RealtimeChannelService {
   private reconnectTimer: number | null = null;
   private messageQueue: string[] = [];
 
+  // Global Multi-Cloud MQTT Relay (Works seamlessly on Vercel, Netlify, Cloud Run, Mobile)
+  private mqttClient: MqttClient | null = null;
+  private mqttConnected: boolean = false;
+
   public init(roomCode: string, participantInfo?: ParticipantMeta): void {
     const cleanRoom = roomCode.toUpperCase().trim();
     if (participantInfo) {
@@ -57,7 +64,9 @@ class RealtimeChannelService {
 
     if (
       this.currentRoom === cleanRoom &&
-      ((this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) || this.channel)
+      ((this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) ||
+       (this.mqttClient && this.mqttConnected) ||
+       this.channel)
     ) {
       return;
     }
@@ -96,6 +105,66 @@ class RealtimeChannelService {
 
     // 3. Robust Internal Full-Stack WebSocket Server (/ws)
     this.connectInternalWebSocket(cleanRoom);
+
+    // 4. Global Multi-Cloud Relay over Secure WebSockets (HiveMQ / EMQX)
+    this.connectMqttRelay(cleanRoom);
+  }
+
+  private connectMqttRelay(roomCode: string): void {
+    const topic = `edumeet/v2/room/${roomCode}`;
+    const brokers = [
+      'wss://broker.hivemq.com:8884/mqtt',
+      'wss://broker.emqx.io:8084/mqtt'
+    ];
+    let brokerIndex = 0;
+
+    const tryConnect = () => {
+      try {
+        if (this.mqttClient) {
+          try { this.mqttClient.end(true); } catch (e) {}
+          this.mqttClient = null;
+        }
+
+        const brokerUrl = brokers[brokerIndex];
+        const client = mqtt.connect(brokerUrl, {
+          keepalive: 30,
+          clean: true,
+          reconnectPeriod: 3000,
+          connectTimeout: 5000,
+          clientId: `edumeet_${(this.currentSenderId || 'peer').replace(/[^a-zA-Z0-9]/g, '')}_${Math.random().toString(36).substring(2, 6)}`
+        });
+        this.mqttClient = client;
+
+        client.on('connect', () => {
+          this.mqttConnected = true;
+          client.subscribe(topic, { qos: 0 });
+        });
+
+        client.on('message', (_t, messageBuffer) => {
+          try {
+            const event: RoomEvent = JSON.parse(messageBuffer.toString());
+            if (event && event.roomCode === this.currentRoom) {
+              this.notifyListeners(event);
+            }
+          } catch (err) {
+            // ignore non-json
+          }
+        });
+
+        client.on('error', (err) => {
+          this.mqttConnected = false;
+          brokerIndex = (brokerIndex + 1) % brokers.length;
+        });
+
+        client.on('close', () => {
+          this.mqttConnected = false;
+        });
+      } catch (err) {
+        console.warn('[Realtime MQTT] Init warning:', err);
+      }
+    };
+
+    tryConnect();
   }
 
   private connectInternalWebSocket(roomCode: string): void {
@@ -215,6 +284,15 @@ class RealtimeChannelService {
       this.messageQueue.push(rawString);
       if (this.messageQueue.length > 50) this.messageQueue.shift();
     }
+
+    // 4. Global Multi-Cloud MQTT Relay
+    if (this.mqttClient && this.mqttConnected) {
+      try {
+        this.mqttClient.publish(`edumeet/v2/room/${this.currentRoom}`, rawString, { qos: 0 });
+      } catch (err) {
+        console.warn('Error publishing to MQTT relay:', err);
+      }
+    }
   }
 
   public subscribe(type: EventType | '*', listener: EventListener): () => void {
@@ -272,6 +350,13 @@ class RealtimeChannelService {
     if (this.ws) {
       this.ws.close();
       this.ws = null;
+    }
+    if (this.mqttClient) {
+      try {
+        this.mqttClient.end(true);
+      } catch (e) {}
+      this.mqttClient = null;
+      this.mqttConnected = false;
     }
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);

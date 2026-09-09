@@ -44,32 +44,42 @@ const RemoteVideoPlayer: React.FC<{
   name: string;
 }> = ({ stream, isCameraOff, name }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
   useEffect(() => {
     if (videoRef.current && stream) {
       videoRef.current.srcObject = stream;
       videoRef.current.play().catch(err => console.warn("Remote video playback note:", err));
     }
+    if (audioRef.current && stream) {
+      audioRef.current.srcObject = stream;
+      audioRef.current.play().catch(err => console.warn("Remote audio playback note:", err));
+    }
   }, [stream]);
 
-  if (isCameraOff) {
-    return (
-      <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900/90 text-slate-400 gap-3">
-        <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white text-2xl font-extrabold shadow-lg shadow-indigo-600/20">
-          {name.charAt(0).toUpperCase()}
-        </div>
-        <span className="text-xs text-slate-400 font-medium">Cámara Desactivada</span>
-      </div>
-    );
-  }
-
   return (
-    <video
-      ref={videoRef}
-      autoPlay
-      playsInline
-      className="w-full h-full object-cover"
-    />
+    <div className="w-full h-full relative">
+      {/* Persistent audio element so participant voice is always audible */}
+      <audio ref={audioRef} autoPlay playsInline />
+
+      {/* Video element */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        className={`w-full h-full object-cover ${isCameraOff ? 'hidden' : 'block'}`}
+      />
+
+      {/* Camera Off Avatar Placeholder */}
+      {isCameraOff && (
+        <div className="w-full h-full flex flex-col items-center justify-center bg-slate-900/90 text-slate-400 gap-3">
+          <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-indigo-600 to-purple-600 flex items-center justify-center text-white text-2xl font-extrabold shadow-lg shadow-indigo-600/20">
+            {name.charAt(0).toUpperCase()}
+          </div>
+          <span className="text-xs text-slate-400 font-medium">Cámara Desactivada</span>
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -323,12 +333,23 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' }
-      ]
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        { urls: 'stun:stun.services.mozilla.com' },
+        { urls: 'stun:global.stun.twilio.com:3478' }
+      ],
+      iceCandidatePoolSize: 10
     };
 
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnectionsRef.current.set(targetId, pc);
+
+    // Ensure audio & video transceivers exist so streams negotiate properly in both directions
+    try {
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+      pc.addTransceiver('video', { direction: 'sendrecv' });
+    } catch (e) {}
 
     // Add / sync local tracks using live ref values (not stale closure state)
     const liveLocal = localStreamRef.current;
@@ -351,6 +372,14 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
         setRemoteStreams(prev => {
           const next = new Map(prev);
           next.set(targetId, rStream);
+          return next;
+        });
+      } else if (event.track) {
+        setRemoteStreams(prev => {
+          const existing = prev.get(targetId) || new MediaStream();
+          existing.addTrack(event.track);
+          const next = new Map(prev);
+          next.set(targetId, existing);
           return next;
         });
       }
@@ -478,6 +507,25 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             isScreenSharing: isScreenSharingRef.current,
             joinedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           });
+          break;
+        }
+
+        case 'CLASS_INFO_REQUEST': {
+          if (userRole === 'admin') {
+            realtimeService.send('CLASS_INFO_RESPONSE', userId, {
+              classSession: {
+                id: classSession.id,
+                code: classSession.code,
+                title: classSession.title,
+                subject: classSession.subject,
+                date: classSession.date,
+                time: classSession.time,
+                accessMode: classSession.accessMode,
+                adminName: classSession.adminName,
+                status: 'live'
+              }
+            });
+          }
           break;
         }
 
@@ -886,7 +934,7 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
   };
 
   const copyRoomLink = () => {
-    const link = `${window.location.origin}/?room=${encodeURIComponent(classSession.code)}&role=student`;
+    const link = `${window.location.origin}/?room=${encodeURIComponent(classSession.code)}&role=student&title=${encodeURIComponent(classSession.title)}&admin=${encodeURIComponent(classSession.adminName)}&mode=${classSession.accessMode}&subject=${encodeURIComponent(classSession.subject)}`;
     navigator.clipboard.writeText(link);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
@@ -934,6 +982,41 @@ export const ConferenceRoom: React.FC<ConferenceRoomProps> = ({
             </div>
           )}
         </div>
+
+        {/* Floating Teacher Approval Alert Banner */}
+        {userRole === 'admin' && pendingRequests.length > 0 && (
+          <div className="absolute top-18 left-1/2 transform -translate-x-1/2 z-30 w-full max-w-md px-4 pointer-events-auto">
+            <div className="bg-amber-500 text-slate-950 p-3.5 rounded-2xl shadow-2xl border border-amber-400 flex items-center justify-between gap-4 backdrop-blur-md animate-pulse">
+              <div className="flex items-center gap-3">
+                <div className="w-8 h-8 rounded-full bg-slate-950 text-amber-400 flex items-center justify-center font-bold text-xs">
+                  {pendingRequests[0].name.charAt(0).toUpperCase()}
+                </div>
+                <div>
+                  <p className="font-extrabold text-xs leading-tight">
+                    {pendingRequests[0].name}
+                  </p>
+                  <p className="text-[10px] font-semibold text-slate-900">
+                    Solicita ingresar a la clase
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleAcceptParticipant(pendingRequests[0].id)}
+                  className="bg-slate-950 text-white hover:bg-slate-900 px-3 py-1.5 rounded-xl text-xs font-bold transition shadow cursor-pointer"
+                >
+                  Permitir
+                </button>
+                <button
+                  onClick={() => handleRejectParticipant(pendingRequests[0].id)}
+                  className="bg-amber-600/30 hover:bg-amber-600/50 text-slate-950 px-2.5 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer"
+                >
+                  Rechazar
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Dynamic Video Grid */}
         <div className="flex-1 p-4 flex items-center justify-center overflow-y-auto">
